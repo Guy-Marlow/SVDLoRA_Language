@@ -1,0 +1,9 @@
+# Versions verified working in our environment (conda env "treelora").
+torch==2.4.1
+transformers==4.45.2
+peft==0.19.1
+datasets>=2.0.0
+rouge-score
+numpy
+tqdm
+huggingface_hub      # scripts/prefetch_models.py (gated Llama download)

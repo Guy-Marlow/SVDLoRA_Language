@@ -1,0 +1,24 @@
+# ---- unused second benchmark (not imported by tokmem work; has a broken external symlink) ----
+internbootcamp/
+
+# ---- datasets (downloaded via scripts/data_prep.py, never committed) ----
+data/
+**/natural-instructions-2.8/tasks/
+**/natural-instructions-2.8/.git/
+
+# ---- model caches / trained adapters / run artifacts ----
+**/lora_model*/
+**/lora_baseline_model*/
+**/repro_lora_model*/
+**/saved_models/
+**/run_logs/
+**/logs/
+**/*.out
+*.pt
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+*.png
