@@ -291,6 +291,12 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     svd_diag_records = []
 
+    # opt-in (MEM_SNAPSHOT=1): record allocation call-stacks so an OOM dumps a
+    # snapshot pinning exactly which tensors/call-sites hold the memory.
+    _mem_snap = os.environ.get("MEM_SNAPSHOT") == "1"
+    if _mem_snap and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+
     try:
         for i, (task_name, samples) in enumerate(tasks):
             print(f"[task {i+1}/{len(tasks)}] {task_name}  ({len(samples)} samples)")
@@ -322,7 +328,13 @@ def main():
             else:  # svdlora / seqlora
                 trainable = svdlora_trainable_parameters(modules)
 
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             train_one_task(model, trainable, loader, args, extra_loss_fn=extra_loss)
+            if torch.cuda.is_available():
+                _alloc = torch.cuda.memory_allocated() / 1e9
+                _peak = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[mem] task {i}: live_boundary={_alloc:.2f}GB  step_peak={_peak:.2f}GB", flush=True)
 
             if args.method == 'svdlora':
                 diag = compress_all(modules)   # P = 1
@@ -383,6 +395,14 @@ def main():
         metrics["error"] = str(e)[:300]
         if torch.cuda.is_available():
             metrics["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2)
+            if _mem_snap:
+                snap = os.path.join(args.out_dir, f"oom_snapshot_{args.method}_{args.order_seed}.pickle")
+                try:
+                    torch.cuda.memory._dump_snapshot(snap)
+                    print(f"[mem-snapshot] dumped allocation history -> {snap}")
+                    print(torch.cuda.memory_summary())
+                except Exception as _se:
+                    print(f"[mem-snapshot] dump failed: {_se}")
             torch.cuda.empty_cache()
         report.write_metrics(metrics_path, metrics)
         import sys

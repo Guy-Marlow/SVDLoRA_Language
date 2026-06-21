@@ -372,6 +372,7 @@ def evaluate_with_generation(model, tokenizer, test_examples, device="cuda", max
     model.eval()
     
     all_predictions = []
+    all_predictions_old = []   # buggy split('assistant') extraction, kept only to quantify the fix
     all_references = []
     all_task_names = []
     
@@ -417,19 +418,24 @@ def evaluate_with_generation(model, tokenizer, test_examples, device="cuda", max
                 eos_token_id=tokenizer.eos_token_id
             )
         
-        # Decode and extract responses
+        # Decode and extract responses.
+        # FIX: the response is the GENERATED CONTINUATION only -> slice off the prompt
+        # tokens and decode the rest. Left padding makes the prompt length uniform across
+        # the batch (inputs['input_ids'].shape[1]). This is robust to responses that
+        # contain the word "assistant" (the old split('assistant')[-1] truncated those).
+        input_len = inputs['input_ids'].shape[1]
         for j, output in enumerate(outputs):
+            response = tokenizer.decode(output[input_len:], skip_special_tokens=True).strip()
+
+            # OLD buggy extraction, computed on the SAME generation only to quantify the fix
             generated = tokenizer.decode(output, skip_special_tokens=True)
-            
-            # Extract response (after the assistant header)
             if "assistant" in generated:
-                response = generated.split("assistant")[-1].strip()
+                old_response = generated.split("assistant")[-1].strip()
             else:
-                # Fallback: take everything after the input
-                response = generated[len(batch_texts[j]):].strip()
-            
-            # Store predictions and references
+                old_response = generated[len(batch_texts[j]):].strip()
+
             all_predictions.append(response)
+            all_predictions_old.append(old_response)
             all_references.append(batch_examples[j]['responses'])
             if 'tasks' in batch_examples[j]:
                 all_task_names.append(batch_examples[j]['tasks'][0])
@@ -442,7 +448,20 @@ def evaluate_with_generation(model, tokenizer, test_examples, device="cuda", max
         references=all_references,
         task_names=all_task_names
     )
-    
+
+    # dual-report: quantify the extraction bug on the identical generations
+    try:
+        results_old = evaluate_predictions(
+            predictions=all_predictions_old,
+            references=all_references,
+            task_names=all_task_names
+        )
+        print(f"[eval-bugfix] ROUGE-L  OLD split('assistant') = {results_old.get('rougeL')}  "
+              f"|  NEW sliced-continuation = {results.get('rougeL')}  "
+              f"(delta {round((results.get('rougeL') or 0) - (results_old.get('rougeL') or 0), 3)})", flush=True)
+    except Exception as _e:
+        print(f"[eval-bugfix] dual-report failed: {_e}", flush=True)
+
     return results, all_predictions
 
 def generate_responses(model, tokenizer, test_examples, device="cuda", max_new_tokens=256):

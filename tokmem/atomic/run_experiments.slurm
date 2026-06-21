@@ -1,27 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=svdlora_lang_1000t
+#SBATCH --job-name=svdlora_lang_400t
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --open-mode=append
 #SBATCH --output=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/slurm_experiments_%j.out
 #SBATCH --error=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/slurm_experiments_%j.err
 #
-# Paper-worthy language CL comparison on Super-NaturalInstructions atomic recall.
+# Language CL comparison on Super-NaturalInstructions atomic recall.
 #   5 methods x 3 seeds = 15 runs, 400 tasks (500 train / 50 test, 1 epoch).
 #   Methods: seqlora, svdlora (fixed r_hat=8), svdlora (adaptive eps=0.005), olora, inflora.
-#   3 seeds (1993/1994/1995) each define a FIXED task ORDER (--order_seed); the 400-task
-#   SET is constant across all runs, only the order varies. Same order across methods.
-#   SEED-MAJOR: seed N's methods are submitted (and so run) before seed N+1's, so you get
-#   every method for >=1 ordering early. Logs stream live and are readable mid-run.
 #
-# We request 2 GPUs (defensive: if the cluster's busted card is one of them, the job still
-# runs on the good one). Work is launched as SLURM job steps and SLURM decides placement --
-# we do NOT pin CUDA_VISIBLE_DEVICES. With 2 good GPUs, 2 runs go at once; with 1, sequentially.
-# Each run is wrapped so a crash/OOM cannot abort the whole job (the harness also OOM-guards
-# internally and exits 0, writing partial metrics).
+# GPUs are requested ONCE, here in the #SBATCH header. The job body does NOT allocate GPUs
+# (no `srun --gres`): SLURM hands us the allocated device(s) via $CUDA_VISIBLE_DEVICES, and we
+# just call python on them. If you bump `--gres=gpu:N` above, the script auto-detects the N
+# devices and runs N lanes in parallel; with gpu:1 (default) everything runs sequentially on
+# the single allocated GPU.
 #
-# NOTE: create run_logs/ before submitting (SBATCH opens --output before the script runs):
-#   mkdir -p .../tokmem/atomic/run_logs   &&   sbatch run_experiments.slurm
+# Ordering: the fast O(1) methods (seqlora, svdlora) run FIRST across all seeds, so usable
+# results land in hours; the slow O(K) bank methods (olora, inflora) run LAST. No gradient
+# checkpointing -- on H200 (141GB) the un-checkpointed per-step peak (~40GB) fits with huge
+# headroom, and skipping recompute is several times faster (the point of the big card).
 
 ATOMIC=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic
 cd "$ATOMIC"
@@ -36,7 +34,12 @@ COMMON="--num_tasks 400 --train_size 500 --val_size 10 --test_size 50 \
   --max_length 1024 --max_instruction_tokens 1024 --eval_batch_size 16 \
   --lr 5e-5 --lora_r 8 --lora_alpha 32"
 
-# label | method-specific args  (label only affects the per-run log filename)
+# Devices SLURM allocated to THIS job (it populates CUDA_VISIBLE_DEVICES; default to 0 if unset).
+IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:-0}"
+NGPU=${#GPUS[@]}
+echo "Allocated GPUs: ${GPUS[*]}  (N=$NGPU)  $(date)"
+
+# fast O(1) methods FIRST (hours each), slow O(K) banks LAST (days each, checkpointed -> no OOM)
 RUNS=(
   "seqlora|--method seqlora"
   "svdlora_fixed|--method svdlora --svd_rank 8"
@@ -44,28 +47,34 @@ RUNS=(
   "olora|--method olora"
   "inflora|--method inflora"
 )
+SEEDS=(1993 1994 1995)
 
-# SEED-MAJOR submission: all of seed 1993's methods are submitted before 1994's, etc., so
-# SLURM (FIFO across the allocated GPUs) finishes config 1993's methods first -> you get every
-# method for >=1 ordering ASAP. No barrier between seeds: if a GPU frees, the next config's
-# method may start early (fine). Each run streams to its own log, readable live without
-# interrupting anything.
-for SEED in 1993 1994 1995; do
-  for entry in "${RUNS[@]}"; do
-    LABEL="${entry%%|*}"
-    EXTRA="${entry#*|}"
-    LOG="run_logs/exp_${LABEL}_${SEED}.out"
-    # one SLURM job step per run; SLURM schedules these across the allocated GPUs.
-    srun --exclusive --gres=gpu:1 --ntasks=1 bash -lc "
-      cd '$ATOMIC'
-      conda activate treelora 2>/dev/null || true
-      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      echo \"==== START ${LABEL} seed ${SEED} \$(date) ====\"
-      python main_svdlora_baseline.py $COMMON --order_seed ${SEED} --seed ${SEED} ${EXTRA} > '$LOG' 2>&1 || true
-      echo \"==== DONE  ${LABEL} seed ${SEED} \$(date) ====\"
-      true
-    " &
+# Flat job list, method-major so all fast methods (every seed) precede the banks.
+JOBS=()
+for entry in "${RUNS[@]}"; do
+  for SEED in "${SEEDS[@]}"; do
+    JOBS+=("${SEED}|${entry}")
   done
+done
+
+# One lane per allocated GPU; each lane runs its share of JOBS sequentially on its device.
+run_lane () {   # $1 = physical gpu id (a value from CUDA_VISIBLE_DEVICES)   $2 = lane index
+  local gpu="$1" lane="$2"
+  for idx in "${!JOBS[@]}"; do
+    (( idx % NGPU == lane )) || continue
+    local job="${JOBS[idx]}"
+    local SEED="${job%%|*}"; local rest="${job#*|}"
+    local LABEL="${rest%%|*}"; local EXTRA="${rest#*|}"
+    echo "==== START ${LABEL} seed ${SEED} on gpu ${gpu} $(date) ===="
+    CUDA_VISIBLE_DEVICES="${gpu}" python main_svdlora_baseline.py $COMMON \
+      --order_seed "${SEED}" --seed "${SEED}" ${EXTRA} \
+      > "run_logs/exp_${LABEL}_${SEED}.out" 2>&1 || true
+    echo "==== DONE  ${LABEL} seed ${SEED} $(date) ===="
+  done
+}
+
+for lane in "${!GPUS[@]}"; do
+  run_lane "${GPUS[lane]}" "${lane}" &
 done
 wait
 echo "ALL RUNS COMPLETE $(date)"
