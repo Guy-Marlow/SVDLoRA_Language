@@ -213,11 +213,27 @@ def main():
                     model=model, train_data=samples, val_data=None, test_data=None,
                     tokenizer=tokenizer, batch_size=args.batch_size, max_length=args.max_length,
                     eval_batch_size=args.eval_batch_size)
-                train_task_calling_model(
-                    model=model, dataloader=task_loader, val_dataloader=None,
-                    num_epochs=args.num_epochs, lr=args.lr,
-                    gradient_accumulation_steps=args.gradient_accumulation_steps,
-                    device=args.device, timestamp=timestamp, validate_every_n_steps=0)
+                # ZERO INTERFERENCE (paper): only the NEW token's embedding may update. The
+                # full-vocab softmax would otherwise push every other task token's logit down
+                # at task t's positions, corrupting all previously-learned tokens. Mask the
+                # gradient so only row `idx` moves.
+                _emb_params = [model.trainable_task_input_embeddings]
+                if model.decouple_embeddings:
+                    _emb_params.append(model.trainable_task_output_embeddings)
+                _hooks = []
+                for _p in _emb_params:
+                    _mask = torch.zeros(model.num_tasks, 1, device=_p.device, dtype=_p.dtype)
+                    _mask[idx] = 1.0
+                    _hooks.append(_p.register_hook(lambda g, m=_mask: g * m))
+                try:
+                    train_task_calling_model(
+                        model=model, dataloader=task_loader, val_dataloader=None,
+                        num_epochs=args.num_epochs, lr=args.lr,
+                        gradient_accumulation_steps=args.gradient_accumulation_steps,
+                        device=args.device, timestamp=timestamp, validate_every_n_steps=0)
+                finally:
+                    for _h in _hooks:
+                        _h.remove()
                 if args.renorm:
                     model.renormalize(idx, trained, eps=args.renorm_eps)  # rescale to bank norm
                 trained.append(idx)
