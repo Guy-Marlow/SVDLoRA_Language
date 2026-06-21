@@ -184,6 +184,8 @@ def main():
     # order_seed=None -> legacy global-shuffle selection.
     p.add_argument('--order_seed', type=int, default=None)
     p.add_argument('--set_seed', type=int, default=0)
+    p.add_argument('--out_dir', default="run_logs",
+                   help='where metrics/diag/pertask JSONs are written (default run_logs/)')
     # adapter HPs (match baseline: r=8, alpha=32, q_proj+v_proj)
     p.add_argument('--lora_r', type=int, default=8)
     p.add_argument('--lora_alpha', type=float, default=32.0)
@@ -274,12 +276,12 @@ def main():
     print(f"Training sequentially over {len(tasks)} tasks")
 
     # run id + incremental metrics (survive any crash)
-    os.makedirs("run_logs", exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
     _seed_tag = f"_s{args.order_seed}" if args.order_seed is not None else ""
     _tag = f"{args.svd_layers}_{args.num_tasks}t{_seed_tag}" + (
         f"_adapt{args.svd_energy_target}" if args.svd_energy_target is not None else "")
-    svd_diag_path = f"run_logs/svdlora_diag_{args.method}_{_tag}.json"
-    metrics_path = f"run_logs/metrics_{args.method}_{_tag}.json"
+    svd_diag_path = f"{args.out_dir}/svdlora_diag_{args.method}_{_tag}.json"
+    metrics_path = f"{args.out_dir}/metrics_{args.method}_{_tag}.json"
     metrics = {"method": args.method, "num_tasks": args.num_tasks, "order_seed": args.order_seed,
                "seed": args.seed, "train_size": args.train_size, "lora_r": args.lora_r,
                "energy_target": args.svd_energy_target, "svd_rank": args.svd_rank,
@@ -355,7 +357,7 @@ def main():
             device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
         print_evaluation_results(results)
         if "per_task" in results:
-            with open(f"run_logs/pertask_{args.method}_{_tag}.json", "w") as f:
+            with open(f"{args.out_dir}/pertask_{args.method}_{_tag}.json", "w") as f:
                 json.dump(results["per_task"], f, indent=2)
 
         # ---- final performance report (memory / FLOPs / accuracy / peak VRAM) ----
