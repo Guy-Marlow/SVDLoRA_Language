@@ -270,6 +270,8 @@ def sample_natural_instructions_tasks(
     val_size: Optional[int] = None,
     test_size: Optional[int] = None,
     few_shot: bool = False,
+    set_seed: Optional[int] = None,
+    order_seed: Optional[int] = None,
 ):
     """Sample a few tasks from Natural Instructions dataset and split with absolute sizes per task
     
@@ -289,55 +291,21 @@ def sample_natural_instructions_tasks(
     """
     if not os.path.exists(tasks_dir):
         raise FileNotFoundError(f"Tasks directory not found: {tasks_dir}")
-    
-    # Get all task files
-    all_task_files = [f for f in os.listdir(tasks_dir) if f.startswith('task') and f.endswith('.json')]
-    
-    # Filter for English-only tasks
-    print(f"🔍 Filtering {len(all_task_files)} tasks for English input/output...")
-    english_task_files = []
-    
-    for task_file in all_task_files:
-        task_path = os.path.join(tasks_dir, task_file)
-        try:
-            with open(task_path, 'r') as f:
-                task_data = json.load(f)
-            
-            # Check if both input and output languages are English
-            input_lang = task_data.get('Input_language', [])
-            output_lang = task_data.get('Output_language', [])
-            
-            # Keep tasks where English is in both input and output languages
-            if ('English' in input_lang or input_lang == ['English']) and \
-               ('English' in output_lang or output_lang == ['English']):
-                english_task_files.append(task_file)
-                
-        except Exception as e:
-            print(f"Warning: Could not read {task_file}: {e}")
-            continue
-    
-    print(f"✅ Found {len(english_task_files)} English-only tasks out of {len(all_task_files)} total")
-    
-    if len(english_task_files) < num_tasks:
-        print(f"Warning: Only {len(english_task_files)} English tasks found, using all of them")
-        num_tasks = len(english_task_files)
-        task_files = english_task_files
-    else:
-        task_files = english_task_files
-    
-    # Use deterministic sampling to ensure smaller samples are subsets of larger ones
-    # Sort task files to ensure reproducible ordering
-    task_files_sorted = sorted(task_files)
-    
-    # Shuffle the sorted list using the global seed already set in main
-    # This preserves the global determinism while ensuring hierarchical sampling
-    random.shuffle(task_files_sorted)
-    
-    # Take the first num_tasks from the shuffled list
-    # This ensures that tasks 1-5 are the same whether you ask for 5 or 10 tasks
-    sampled_files = task_files_sorted[:num_tasks]
-    
-    print(f"Sampled {num_tasks} English-only tasks: {sampled_files}")
+
+    # Selection + ordering is centralized in task_order.ordered_task_names:
+    #   order_seed=None  -> original hierarchical global-RNG shuffle (backward compatible)
+    #   order_seed set   -> FIXED set (set_seed) then per-run permutation (order_seed)
+    from task_order import english_task_files, ordered_task_names
+    eng = english_task_files(tasks_dir)
+    print(f"✅ Found {len(eng)} English-only tasks")
+    if len(eng) < num_tasks:
+        print(f"Warning: Only {len(eng)} English tasks found, using all of them")
+        num_tasks = len(eng)
+    sampled_files = ordered_task_names(tasks_dir, num_tasks, set_seed=set_seed if set_seed is not None else 0,
+                                       order_seed=order_seed, english_files=eng)
+    num_tasks = len(sampled_files)
+
+    print(f"Sampled {num_tasks} English-only tasks: {sampled_files[:8]}{'...' if len(sampled_files) > 8 else ''}")
     
     all_train_data = []
     all_val_data = []

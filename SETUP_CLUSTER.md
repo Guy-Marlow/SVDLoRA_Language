@@ -4,6 +4,21 @@ Long-horizon language CL bench: SVDLoRA vs the TokMem atomic-recall LoRA baselin
 Super-NaturalInstructions. Active code is in `tokmem/atomic/`. No data or model weights
 are committed. `internbootcamp/` (a second, not-yet-used benchmark) is gitignored.
 
+## 0. One-shot setup
+After `conda activate <env>` and authenticating to HuggingFace (`export HF_TOKEN=hf_xxx`,
+Llama-3.2 access granted), run:
+```bash
+bash setup.sh      # installs deps, caches Llama-3.2-3B, fetches Super-NaturalInstructions
+```
+Then launch the headline experiment (12 runs = 4 methods × 3 seeds, 1000 tasks):
+```bash
+cd tokmem/atomic && mkdir -p run_logs && sbatch run_experiments.slurm
+```
+Results land in `tokmem/atomic/run_logs/`: `exp_<method>_<seed>.out` (logs) and
+`metrics_<method>_<tag>.json` (final ROUGE-L/EM, deployed-adapter memory bytes, inference
+FLOPs/token, peak VRAM, per-task memory curve, run `status`). The manual steps below are the
+breakdown of `setup.sh`.
+
 ## 1. Environment
 ```bash
 pip install -r requirements.txt

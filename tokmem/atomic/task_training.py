@@ -111,7 +111,10 @@ def train_task_calling_model(model, dataloader, val_dataloader=None, num_epochs=
     
     # Only train the trainable task embedding parameters 
     trainable_params = model.get_trainable_parameters()
-    optimizer = AdamW(trainable_params, lr=lr, weight_decay=0.01)
+    # weight_decay=0 for TokMem (paper). NB: AdamW decay hits ALL task embeddings every step,
+    # including already-trained ones from previous tasks -> nonzero decay would erode the bank
+    # during sequential training. Must be 0.
+    optimizer = AdamW(trainable_params, lr=lr, weight_decay=0.0)
     
     total_steps = len(dataloader) * num_epochs
     

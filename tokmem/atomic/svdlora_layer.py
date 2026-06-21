@@ -31,11 +31,16 @@ import torch.nn as nn
 
 
 @torch.no_grad()
-def rand_svd(M: torch.Tensor, target_rank: int, oversampling: int):
+def rand_svd(M: torch.Tensor, target_rank: int, oversampling: int,
+             return_singular_values: bool = False):
     """Randomised SVD factorisation B_hat @ A_hat ~= M for M of shape [m, n].
 
     Returns (B_hat [m, target_rank], A_hat [target_rank, n]).  Computed in the
     dtype of M (cast to float32 by the caller for numerical stability).
+    If ``return_singular_values`` also returns S (the singular values of M_bar,
+    length target_rank+oversampling); when target_rank+oversampling >= rank(M)
+    these are the exact singular values of M -- used by the adaptive-rank path
+    to pick the target rank for free (no separate full SVD).
     """
     omega = torch.randn(M.shape[1], target_rank + oversampling, device=M.device, dtype=M.dtype)
     Y = M @ omega
@@ -46,6 +51,8 @@ def rand_svd(M: torch.Tensor, target_rank: int, oversampling: int):
     U = (Q @ U_bar)[:, :target_rank]
     B_hat = U @ S_root
     A_hat = S_root @ Vh[:target_rank, :]
+    if return_singular_values:
+        return B_hat, A_hat, S
     return B_hat, A_hat
 
 
@@ -53,8 +60,13 @@ class SVDLoRALinear(nn.Module):
     """Wraps a frozen nn.Linear with a frozen SVD sketch + a trainable residual."""
 
     def __init__(self, base_linear: nn.Linear, r: int, r_hat: int,
-                 alpha: float, oversampling: int, dropout: float = 0.0):
+                 alpha: float, oversampling: int, dropout: float = 0.0,
+                 energy_target: float = None, diag: bool = False):
         super().__init__()
+        # diag: log per-task retained-energy/sigma diagnostics. For the FIXED-rank path this
+        # needs an extra full svdvals(dW) per module per task -> EXPENSIVE; default OFF for real
+        # runs. (The adaptive path gets these for free from its rand_svd spectrum.)
+        self.diag = diag
         self.base = base_linear
         for p in self.base.parameters():
             p.requires_grad = False
@@ -63,8 +75,18 @@ class SVDLoRALinear(nn.Module):
         self.out_features = base_linear.out_features
         self.r = r
         self.r_hat = r_hat
+        # adaptive-rank mode: if set (e.g. 0.01), each compress keeps the SMALLEST
+        # rank that retains (1 - energy_target) of the accumulated delta's energy,
+        # growing the sketch only as much as the data's intrinsic rank demands.
+        # None => the original fixed-rank-r_hat path (untouched).
+        self.energy_target = energy_target
         self.scale = alpha / r                      # PEFT convention, matches baseline
         self.oversampling = oversampling
+        self.last_retained = None         # retained-energy frac at last compress
+        self.last_sigma_next = None       # σ_{r̂+1} (largest deleted value) at last compress
+        self.last_fro = None              # ||ΔW||_F of accumulated effective delta
+        self.last_residual_fro = None     # ||s·B_rA_r||_F of this task's residual
+        self.last_r_hat = None            # sketch rank chosen at last compress (adaptive)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         dtype = base_linear.weight.dtype
@@ -96,20 +118,76 @@ class SVDLoRALinear(nn.Module):
     def compress(self):
         """Fold residual into the sketch via rand_svd, then reset the residual."""
         dtype = self.sketch_B.dtype
-        dW = (self.sketch_B.float() @ self.sketch_A.float()
-              + self.scale * (self.lora_B.float() @ self.lora_A.float()))
+        resid = self.scale * (self.lora_B.float() @ self.lora_A.float())
+        if self.diag:
+            # this task's residual contribution norm (diagnostic)
+            self.last_residual_fro = resid.norm().item()
+        dW = self.sketch_B.float() @ self.sketch_A.float() + resid
+
+        if self.energy_target is None:
+            self._compress_fixed(dW, dtype)
+        else:
+            self._compress_adaptive(dW, dtype)
+        self.last_r_hat = self.r_hat
+        self.reset_residual()
+
+    def _compress_fixed(self, dW, dtype):
+        """Original fixed-rank-r_hat compression (behaviour unchanged)."""
+        if self.diag:
+            # --- diagnostics on the pre-truncation accumulated ΔW (EXTRA full SVD) ---
+            S = torch.linalg.svdvals(dW)                   # singular values, descending
+            e = S.pow(2); tot = e.sum()
+            self.last_retained = (e[:self.r_hat].sum() / tot).item() if tot > 0 else 1.0
+            self.last_sigma_next = S[self.r_hat].item() if S.numel() > self.r_hat else 0.0
+            self.last_fro = tot.sqrt().item()
         B_hat, A_hat = rand_svd(dW, self.r_hat, self.oversampling)
         self.sketch_B = B_hat.to(dtype)
         self.sketch_A = A_hat.to(dtype)
-        self.reset_residual()
+
+    def _compress_adaptive(self, dW, dtype):
+        """Adaptive-rank compression: keep the smallest rank retaining
+        (1 - energy_target) of the energy.  rank(dW) <= r_hat + r, so one
+        randomized SVD to that bound gives the EXACT spectrum -- the target rank
+        is then a cumsum on those singular values (no separate full SVD)."""
+        max_rank = min(self.sketch_B.shape[1] + self.r, min(dW.shape))
+        B_full, A_full, S = rand_svd(dW, max_rank, self.oversampling,
+                                     return_singular_values=True)
+        e = S.pow(2); tot = e.sum()
+        if tot > 0:
+            cum = torch.cumsum(e, 0) / tot
+            r_hat_t = int((cum < (1.0 - self.energy_target)).sum().item()) + 1
+        else:
+            r_hat_t = 1
+        r_hat_t = max(1, min(r_hat_t, max_rank))
+        # diagnostics from the SAME spectrum (no extra svdvals)
+        self.last_retained = (e[:r_hat_t].sum() / tot).item() if tot > 0 else 1.0
+        self.last_sigma_next = S[r_hat_t].item() if S.numel() > r_hat_t else 0.0
+        self.last_fro = tot.sqrt().item()
+        # truncate the (rank-ordered) factors to the chosen rank
+        self.sketch_B = B_full[:, :r_hat_t].to(dtype).contiguous()
+        self.sketch_A = A_full[:r_hat_t, :].to(dtype).contiguous()
+        self.r_hat = r_hat_t
+
+
+def _layer_index_of(name):
+    """Parse the transformer block index from a module name like
+    'model.layers.13.self_attn.q_proj' -> 13 (returns -1 if not found)."""
+    parts = name.split(".")
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return int(parts[i + 1])
+    return -1
 
 
 def inject_svdlora(model, target_modules=("q_proj", "v_proj"), r=8, r_hat=8,
-                   alpha=32.0, oversampling=10, dropout=0.0):
+                   alpha=32.0, oversampling=10, dropout=0.0, layer_indices=None,
+                   energy_target=None, diag=False):
     """Replace each target nn.Linear in `model` with an SVDLoRALinear wrapper.
 
     Freezes every base parameter; only the residual lora_A/lora_B remain trainable.
-    Returns the list of inserted SVDLoRALinear modules (for compression / param collection).
+    ``layer_indices`` (a set of block indices) restricts injection to those blocks;
+    None = every block.  ``energy_target`` (None = fixed-rank) enables adaptive
+    rank.  Returns the list of inserted SVDLoRALinear modules.
     """
     for p in model.parameters():
         p.requires_grad = False
@@ -118,6 +196,8 @@ def inject_svdlora(model, target_modules=("q_proj", "v_proj"), r=8, r_hat=8,
     replace = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and name.split(".")[-1] in target_modules:
+            if layer_indices is not None and _layer_index_of(name) not in layer_indices:
+                continue
             replace.append(name)
 
     inserted = []
@@ -126,7 +206,8 @@ def inject_svdlora(model, target_modules=("q_proj", "v_proj"), r=8, r_hat=8,
         child_name = name.rsplit(".", 1)[1]
         base_linear = getattr(parent, child_name)
         wrapper = SVDLoRALinear(base_linear, r=r, r_hat=r_hat, alpha=alpha,
-                                oversampling=oversampling, dropout=dropout)
+                                oversampling=oversampling, dropout=dropout,
+                                energy_target=energy_target, diag=diag)
         setattr(parent, child_name, wrapper)
         inserted.append(wrapper)
     return inserted
@@ -142,3 +223,29 @@ def svdlora_trainable_parameters(modules):
 def compress_all(modules):
     for m in modules:
         m.compress()
+    # aggregate the per-module compression diagnostics
+    ret = [m.last_retained for m in modules if m.last_retained is not None]
+    sig = [m.last_sigma_next for m in modules if m.last_sigma_next is not None]
+    fro = [m.last_fro for m in modules if m.last_fro is not None]
+    rfro = [m.last_residual_fro for m in modules if m.last_residual_fro is not None]
+    rhat = [m.last_r_hat for m in modules if m.last_r_hat is not None]
+    if not ret:
+        return None
+    import numpy as _np
+    # each diagnostic list may be empty depending on which fields were populated
+    # (the fixed path only fills these when diag=True; the adaptive path fills
+    # retained/sigma/fro for free but not residual_fro) -> guard every reduction.
+    def _m(v, fn):
+        return float(fn(v)) if len(v) else None
+    out = {
+        "retained_mean": _m(ret, _np.mean), "retained_min": _m(ret, _np.min),
+        "sigma_next_mean": _m(sig, _np.mean), "sigma_next_max": _m(sig, _np.max),
+        "fro_mean": _m(fro, _np.mean), "fro_max": _m(fro, _np.max),
+        "residual_fro_mean": _m(rfro, _np.mean), "residual_fro_max": _m(rfro, _np.max),
+        # adaptive-rank: the sketch rank chosen this task (mean/max/total across modules)
+        "r_hat_mean": _m(rhat, _np.mean), "r_hat_max": _m(rhat, _np.max),
+        "r_hat_total": int(_np.sum(rhat)) if rhat else None,
+        "retained": ret, "sigma_next": sig, "fro": fro, "residual_fro": rfro,
+        "r_hat": rhat,   # per-module rank (module order = layer0.q, layer0.v, layer1.q, ...)
+    }
+    return out

@@ -93,8 +93,17 @@ def main():
     parser.add_argument('--val_size', type=int, default=None, help='Absolute number of validation samples per task (overrides val_ratio)')
     parser.add_argument('--test_size', type=int, default=None, help='Absolute number of test samples per task (overrides test_ratio; test selected first deterministically)')
     parser.add_argument('--few_shot', action='store_true', help='Use few-shot instructions')
-    parser.add_argument('--validate_every_n_steps', type=int, default=1000, 
+    parser.add_argument('--validate_every_n_steps', type=int, default=1000,
                         help='Validate every n steps')
+    # paper-faithful TokMem: sequential per-task training + renormalization (§2.4/§3.1)
+    parser.add_argument('--sequential', action='store_true',
+                        help='train tasks one at a time in order (paper incremental protocol)')
+    parser.add_argument('--renorm', action='store_true',
+                        help='renormalize each new token to the bank norm after its task (paper Eq 5/6)')
+    parser.add_argument('--renorm_eps', type=float, default=1e-8)
+    # experiment ordering (shared with the LoRA harness): fixed set + per-run permutation
+    parser.add_argument('--order_seed', type=int, default=None)
+    parser.add_argument('--set_seed', type=int, default=0)
     args = parser.parse_args()
     
     # Set random seed first for full reproducibility
@@ -147,6 +156,8 @@ def main():
         val_size=args.val_size,
         test_size=args.test_size,
         few_shot=args.few_shot,
+        set_seed=args.set_seed,
+        order_seed=args.order_seed,
     )
     
     # Initialize model
@@ -177,41 +188,53 @@ def main():
             return
         print()
     
-    # Create data loaders
-    print("Creating data loaders...")
-    train_dataloader, val_dataloader, test_dataloader, tokenizer, test_examples = create_natural_instructions_dataloader(
-        model=model,
-        train_data=train_data,
-        val_data=val_data,
-        test_data=test_data,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        eval_batch_size=args.eval_batch_size
-    )
-    
+    # Test/val loaders built once (per-task TRAIN loaders are built inside the sequential loop)
+    print("Creating eval data loaders...")
+    _, val_dataloader, test_dataloader, tokenizer, test_examples = create_natural_instructions_dataloader(
+        model=model, train_data=None, val_data=val_data, test_data=test_data,
+        tokenizer=tokenizer, batch_size=args.batch_size, max_length=args.max_length,
+        eval_batch_size=args.eval_batch_size)
+
     # Training
-    if not args.skip_training and train_dataloader:
-        print("Starting Training...")
-        train_results = train_task_calling_model(
-            model=model,
-            dataloader=train_dataloader,
-            val_dataloader=val_dataloader,
-            num_epochs=args.num_epochs,
-            lr=args.lr,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            device=args.device,
-            timestamp=timestamp,
-            validate_every_n_steps=args.validate_every_n_steps
-        )
-        print(f"Training completed with average loss: {train_results['avg_total_loss']:.4f}")
-        
-        # Load best model state if validation was performed and best model was found
-        if train_results['best_model_state'] is not None:
-            print(f"Loading best model state (validation loss: {train_results['best_val_loss']:.4f})")
-            best_state = train_results['best_model_state']
-            # Load only the available keys (token embeddings) without requiring full state
-            model.load_state_dict(best_state, strict=False)
+    if not args.skip_training:
+        if args.sequential:
+            # Paper incremental protocol: add token -> train on task t's data only -> renormalize.
+            from collections import OrderedDict
+            buckets = OrderedDict()
+            for item in train_data:
+                buckets.setdefault(item['tasks'][0], []).append(item)
+            print(f"Starting SEQUENTIAL training over {len(buckets)} tasks "
+                  f"(renorm={'on' if args.renorm else 'off'})...")
+            trained = []
+            for ti, (tname, samples) in enumerate(buckets.items()):
+                idx = model.task_name_to_id[tname]
+                print(f"\n[TokMem task {ti+1}/{len(buckets)}] {tname} (token idx {idx}, {len(samples)} samples)")
+                task_loader, _, _, _, _ = create_natural_instructions_dataloader(
+                    model=model, train_data=samples, val_data=None, test_data=None,
+                    tokenizer=tokenizer, batch_size=args.batch_size, max_length=args.max_length,
+                    eval_batch_size=args.eval_batch_size)
+                train_task_calling_model(
+                    model=model, dataloader=task_loader, val_dataloader=None,
+                    num_epochs=args.num_epochs, lr=args.lr,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    device=args.device, timestamp=timestamp, validate_every_n_steps=0)
+                if args.renorm:
+                    model.renormalize(idx, trained, eps=args.renorm_eps)  # rescale to bank norm
+                trained.append(idx)
+            print(f"\nSequential training completed over {len(trained)} tasks.")
+        else:
+            # Legacy joint training (single pass over all tasks at once).
+            print("Starting JOINT training...")
+            train_dataloader, _, _, _, _ = create_natural_instructions_dataloader(
+                model=model, train_data=train_data, val_data=None, test_data=None,
+                tokenizer=tokenizer, batch_size=args.batch_size, max_length=args.max_length,
+                eval_batch_size=args.eval_batch_size)
+            train_task_calling_model(
+                model=model, dataloader=train_dataloader, val_dataloader=val_dataloader,
+                num_epochs=args.num_epochs, lr=args.lr,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                device=args.device, timestamp=timestamp,
+                validate_every_n_steps=args.validate_every_n_steps)
         print()
     
     # Demo on a few examples

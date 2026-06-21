@@ -23,6 +23,8 @@ train_lora_model silently divides LR by grad_accum; to match its *effective* LR 
 """
 
 import argparse
+import json
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -36,10 +38,19 @@ from main_lora_baseline import (
     evaluate_with_generation,
 )
 from natural_instructions_eval import print_evaluation_results
+import report
 from svdlora_layer import (
     inject_svdlora,
     svdlora_trainable_parameters,
     compress_all,
+)
+from multislot_lora import (
+    inject_multislot_lora,
+    trainable_parameters as multislot_trainable_parameters,
+    orthogonality_penalty,
+    collect_covariance,
+    init_lora_A_dualgpm,
+    update_dualgpm,
 )
 
 
@@ -72,8 +83,11 @@ class LoRAInstructionsDataset(Dataset):
             parts.append(f"<|start_header_id|>assistant<|end_header_id|>\n{response}<|eot_id|>")
         text = "".join(parts)
 
+        # No padding here: pad dynamically per-batch in svd_collate_fn (exactly
+        # equivalent to max_length padding -- pad tokens are masked -- but far
+        # cheaper, since most SNI samples are well under max_length).
         enc = self.tokenizer(text, truncation=True, max_length=self.max_length,
-                             padding="max_length", return_tensors="pt")
+                             padding=False, return_tensors="pt")
         input_ids = enc.input_ids.squeeze()
         attention_mask = enc.attention_mask.squeeze()
         labels = input_ids.clone()
@@ -104,26 +118,53 @@ def group_by_task(train_data):
     return [(t, buckets[t]) for t in order]
 
 
-def train_one_task(model, modules, task_samples, tokenizer, args):
-    """Fresh optimiser, constant LR (matches baseline: AdamW, no scheduler), N epochs."""
-    ds = LoRAInstructionsDataset(task_samples, tokenizer, max_length=args.max_length)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        collate_fn=lambda b: lora_collate_fn(b, tokenizer))
-    optim = torch.optim.AdamW(svdlora_trainable_parameters(modules), lr=args.lr)
+def svd_collate_fn(batch, tokenizer):
+    """Dynamic padding to the batch-longest sequence (left side, matching
+    tokenizer.padding_side='left'). Pads input_ids with pad_token_id, attention
+    with 0, labels with -100 -> identical masked loss to max_length padding."""
+    maxlen = max(item['input_ids'].size(0) for item in batch)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    left = (getattr(tokenizer, "padding_side", "right") == "left")
+    ids_b, am_b, lb_b = [], [], []
+    for item in batch:
+        ids, am, lb = item['input_ids'], item['attention_mask'], item['labels']
+        n = maxlen - ids.size(0)
+        p_ids = torch.full((n,), pad_id, dtype=ids.dtype)
+        p_am = torch.zeros(n, dtype=am.dtype)
+        p_lb = torch.full((n,), -100, dtype=lb.dtype)
+        if left:
+            ids_b.append(torch.cat([p_ids, ids])); am_b.append(torch.cat([p_am, am])); lb_b.append(torch.cat([p_lb, lb]))
+        else:
+            ids_b.append(torch.cat([ids, p_ids])); am_b.append(torch.cat([am, p_am])); lb_b.append(torch.cat([lb, p_lb]))
+    return {'input_ids': torch.stack(ids_b), 'attention_mask': torch.stack(am_b), 'labels': torch.stack(lb_b)}
+
+
+def build_loader(samples, tokenizer, args, shuffle):
+    ds = LoRAInstructionsDataset(samples, tokenizer, max_length=args.max_length)
+    return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle,
+                      collate_fn=lambda b: svd_collate_fn(b, tokenizer))
+
+
+def train_one_task(model, trainable_params, loader, args, extra_loss_fn=None):
+    """Fresh optimiser, constant LR (matches baseline: AdamW, no scheduler), N epochs.
+    extra_loss_fn() (e.g. O-LoRA's orthogonality penalty) is added to each step's loss."""
+    optim = torch.optim.AdamW(trainable_params, lr=args.lr)
     model.train()
     for epoch in range(args.num_epochs):
         optim.zero_grad()
         for step, batch in enumerate(tqdm(loader, desc=f"  epoch {epoch+1}/{args.num_epochs}", leave=False)):
             batch = {k: v.to(args.device) for k, v in batch.items()}
-            loss = model(**batch).loss / args.gradient_accumulation_steps
-            loss.backward()
+            loss = model(**batch).loss
+            if extra_loss_fn is not None:
+                loss = loss + extra_loss_fn()
+            (loss / args.gradient_accumulation_steps).backward()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optim.step(); optim.zero_grad()
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--method', choices=['svdlora', 'seqlora'], default='svdlora')
+    p.add_argument('--method', choices=['svdlora', 'seqlora', 'olora', 'inflora'], default='svdlora')
     p.add_argument('--tasks_dir', default='natural-instructions-2.8/tasks')
     p.add_argument('--model_name', default="meta-llama/Llama-3.2-3B-Instruct")
     p.add_argument('--num_tasks', type=int, default=10)
@@ -139,22 +180,46 @@ def main():
     p.add_argument('--lr', type=float, default=5e-5)          # effective LR; no division
     p.add_argument('--device', default="cuda")
     p.add_argument('--seed', type=int, default=42)
+    # experiment ordering: fixed task set (set_seed) permuted per run (order_seed).
+    # order_seed=None -> legacy global-shuffle selection.
+    p.add_argument('--order_seed', type=int, default=None)
+    p.add_argument('--set_seed', type=int, default=0)
     # adapter HPs (match baseline: r=8, alpha=32, q_proj+v_proj)
     p.add_argument('--lora_r', type=int, default=8)
     p.add_argument('--lora_alpha', type=float, default=32.0)
     p.add_argument('--lora_dropout', type=float, default=0.1)
     p.add_argument('--target_modules', default="q_proj,v_proj")
-    # sketch HPs
-    p.add_argument('--svd_rank', type=int, default=8)        # r_hat
+    # sketch HPs (svdlora)
+    p.add_argument('--svd_rank', type=int, default=8)        # r_hat (fixed-rank mode)
     p.add_argument('--svd_oversampling', type=int, default=10)
+    # adaptive-rank mode: keep smallest rank retaining (1 - eps) energy each task.
+    # None/unset => original fixed-rank path. e.g. 0.01 keeps 99% energy.
+    p.add_argument('--svd_energy_target', type=float, default=None)
+    # per-task retained-energy diagnostics (extra full SVD/module/task -> EXPENSIVE). OFF for real runs.
+    p.add_argument('--svd_diag', action='store_true')
+    # O-LoRA HPs
+    p.add_argument('--lamda_1', type=float, default=0.5)     # orthogonality weight
+    p.add_argument('--lamda_2', type=float, default=0.0)     # L2 on current LoRA
+    # InfLoRA / DualGPM HPs
+    p.add_argument('--lamb', type=float, default=0.95)       # threshold lower bound
+    p.add_argument('--lame', type=float, default=1.0)        # threshold upper bound
+    # memory: gradient checkpointing (exact; recompute activations in backward)
+    p.add_argument('--gradient_checkpointing', action='store_true')
+    # svdlora layer restriction: all blocks / bottom (low-level) / top (high-level) half
+    p.add_argument('--svd_layers', choices=['all', 'bottom', 'top'], default='all')
     args = p.parse_args()
 
     set_random_seed(args.seed)
     print("=" * 60)
+    detail = {
+        'svdlora': f"P=1 compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}",
+        'seqlora': "single drifting adapter (no compression)",
+        'olora':   f"per-task adapters, orth penalty lamda_1={args.lamda_1} lamda_2={args.lamda_2}",
+        'inflora': f"per-task adapters, DualGPM lamb={args.lamb} lame={args.lame}",
+    }[args.method]
     print(f"{args.method.upper()} for Natural Instructions (atomic recall)")
-    print(f"Model: {args.model_name} | tasks: {args.num_tasks} | P=1 (compress every task)")
-    print(f"adapter r={args.lora_r} alpha={args.lora_alpha} -> r_hat={args.svd_rank} "
-          f"oversampling={args.svd_oversampling} | lr={args.lr}")
+    print(f"Model: {args.model_name} | tasks: {args.num_tasks} | {detail}")
+    print(f"adapter r={args.lora_r} alpha={args.lora_alpha} q/v | lr={args.lr} (no division)")
     print("=" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -166,33 +231,160 @@ def main():
         tasks_dir=args.tasks_dir, num_tasks=args.num_tasks,
         max_instruction_tokens=args.max_instruction_tokens, tokenizer=tokenizer,
         stable_test_split=True, train_size=args.train_size,
-        val_size=args.val_size, test_size=args.test_size, few_shot=False)
+        val_size=args.val_size, test_size=args.test_size, few_shot=False,
+        set_seed=args.set_seed, order_seed=args.order_seed)
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16, device_map=args.device)
-    modules = inject_svdlora(
-        model, target_modules=tuple(args.target_modules.split(",")),
-        r=args.lora_r, r_hat=args.svd_rank, alpha=args.lora_alpha,
-        oversampling=args.svd_oversampling, dropout=args.lora_dropout)
-    n_train = sum(p.numel() for p in svdlora_trainable_parameters(modules))
-    print(f"Injected {len(modules)} SVDLoRA modules | trainable residual params: {n_train:,}")
+    if args.gradient_checkpointing:
+        # exact (recompute, not approximate). use_reentrant=False handles the
+        # frozen base; enable_input_require_grads lets grad reach the adapters.
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
+        print("Gradient checkpointing ENABLED (use_reentrant=False, use_cache=False)")
+    targets = tuple(args.target_modules.split(","))
+    multislot = args.method in ('olora', 'inflora')
+    if multislot:
+        # per-task adapters added lazily (grow one slot per task)
+        modules = inject_multislot_lora(model, target_modules=targets, r=args.lora_r,
+                                        alpha=args.lora_alpha, dropout=args.lora_dropout,
+                                        collect_cov=(args.method == 'inflora'))
+        if args.method == 'inflora':
+            # q_proj/v_proj alternate per layer (q first); q is square (out==in), pair them
+            pairs = list(zip(modules[0::2], modules[1::2]))
+            assert pairs[0][0].out_features == pairs[0][0].in_features, "unexpected q/v order"
+            q_modules = [q for q, _ in pairs]
+    else:
+        # block-range restriction (Llama-3.2-3B has 28 blocks; 14/14 split)
+        layer_indices = {'all': None,
+                         'bottom': set(range(0, 14)),
+                         'top': set(range(14, 28))}[args.svd_layers]
+        modules = inject_svdlora(model, target_modules=targets, r=args.lora_r,
+                                 r_hat=args.svd_rank, alpha=args.lora_alpha,
+                                 oversampling=args.svd_oversampling, dropout=args.lora_dropout,
+                                 layer_indices=layer_indices,
+                                 energy_target=args.svd_energy_target, diag=args.svd_diag)
+    print(f"Injected {len(modules)} adapter modules ({args.method}, svd_layers={args.svd_layers})")
+
+    # InfLoRA DualGPM state (per-module)
+    feature_list, project_type, feature_mat = [], [], []
 
     tasks = group_by_task(train_data)
-    print(f"Training sequentially over {len(tasks)} tasks "
-          f"({'compress after each' if args.method=='svdlora' else 'no compression'})")
-    for i, (task_name, samples) in enumerate(tasks):
-        print(f"[task {i+1}/{len(tasks)}] {task_name}  ({len(samples)} samples)")
-        train_one_task(model, modules, samples, tokenizer, args)
-        if args.method == 'svdlora':
-            compress_all(modules)   # P = 1
+    print(f"Training sequentially over {len(tasks)} tasks")
 
-    # ---- evaluation: identical path to the LoRA baseline ----
-    print("\nEvaluating (greedy generation, pooled test set, NI ROUGE-L)...")
-    results, _ = evaluate_with_generation(
-        model=model, tokenizer=tokenizer, test_examples=test_data,
-        device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
-    print_evaluation_results(results)
-    print(f"\n{args.method.upper()} DONE | ROUGE-L {results['rougeL']:.2f} | EM {results['exact_match']:.2f}")
+    # run id + incremental metrics (survive any crash)
+    os.makedirs("run_logs", exist_ok=True)
+    _seed_tag = f"_s{args.order_seed}" if args.order_seed is not None else ""
+    _tag = f"{args.svd_layers}_{args.num_tasks}t{_seed_tag}" + (
+        f"_adapt{args.svd_energy_target}" if args.svd_energy_target is not None else "")
+    svd_diag_path = f"run_logs/svdlora_diag_{args.method}_{_tag}.json"
+    metrics_path = f"run_logs/metrics_{args.method}_{_tag}.json"
+    metrics = {"method": args.method, "num_tasks": args.num_tasks, "order_seed": args.order_seed,
+               "seed": args.seed, "train_size": args.train_size, "lora_r": args.lora_r,
+               "energy_target": args.svd_energy_target, "svd_rank": args.svd_rank,
+               "status": "running", "tasks_done": 0, "mem_curve": []}
+    report.write_metrics(metrics_path, metrics)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    svd_diag_records = []
+
+    try:
+        for i, (task_name, samples) in enumerate(tasks):
+            print(f"[task {i+1}/{len(tasks)}] {task_name}  ({len(samples)} samples)")
+            loader = build_loader(samples, tokenizer, args, shuffle=True)
+
+            if multislot:
+                for m in modules:
+                    m.add_task()
+
+            extra_loss = None
+            if args.method == 'inflora':
+                # collect input covariance with the accumulated model, set A analytically, freeze A
+                collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
+                init_lora_A_dualgpm(pairs, feature_mat, project_type, i, args.lora_r, args.device)
+                for m in modules:
+                    m.set_trainable(i, train_a=False)
+                trainable = multislot_trainable_parameters(modules)
+            elif args.method == 'olora':
+                for m in modules:
+                    m.set_trainable(i, train_a=True)
+                trainable = multislot_trainable_parameters(modules)
+
+                def extra_loss(idx=i):
+                    pen = args.lamda_1 * orthogonality_penalty(modules, idx)
+                    if args.lamda_2 > 0:
+                        pen = pen + args.lamda_2 * sum(
+                            torch.norm(m.lora_A[idx]) + torch.norm(m.lora_B[idx]) for m in modules)
+                    return pen
+            else:  # svdlora / seqlora
+                trainable = svdlora_trainable_parameters(modules)
+
+            train_one_task(model, trainable, loader, args, extra_loss_fn=extra_loss)
+
+            if args.method == 'svdlora':
+                diag = compress_all(modules)   # P = 1
+                if diag is not None and args.svd_diag:   # diagnostics only when requested
+                    rec = {"task": i, **{k: diag[k] for k in
+                           ("retained_mean", "retained_min", "sigma_next_mean", "sigma_next_max",
+                            "fro_mean", "fro_max", "residual_fro_mean", "residual_fro_max",
+                            "r_hat_mean", "r_hat_max", "r_hat_total")},
+                           "r_hat_per_module": diag.get("r_hat")}
+                    svd_diag_records.append(rec)
+                    with open(svd_diag_path, "w") as f:
+                        json.dump(svd_diag_records, f, indent=2)
+            elif args.method == 'inflora':
+                collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
+                feature_mat = update_dualgpm(q_modules, feature_list, project_type, i, len(tasks),
+                                             args.lamb, args.lame)
+
+            # cheap progress + adapter-memory curve flush (partial results survive failure)
+            metrics["tasks_done"] = i + 1
+            if (i + 1) % 25 == 0 or (i + 1) == len(tasks):
+                metrics["mem_curve"].append({"task": i + 1, "adapter_mb": round(
+                    report.adapter_memory_bytes(modules, args.method) / 1024 / 1024, 4)})
+                report.write_metrics(metrics_path, metrics)
+
+        # ---- evaluation: identical path to the LoRA baseline ----
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_disable()
+            model.config.use_cache = True   # restore KV cache for fast generation
+        print("\nEvaluating (greedy generation, pooled test set, NI ROUGE-L)...")
+        results, _ = evaluate_with_generation(
+            model=model, tokenizer=tokenizer, test_examples=test_data,
+            device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
+        print_evaluation_results(results)
+        if "per_task" in results:
+            with open(f"run_logs/pertask_{args.method}_{_tag}.json", "w") as f:
+                json.dump(results["per_task"], f, indent=2)
+
+        # ---- final performance report (memory / FLOPs / accuracy / peak VRAM) ----
+        metrics["status"] = "done"
+        metrics["rougeL"] = results["rougeL"]
+        metrics["exact_match"] = results["exact_match"]
+        metrics["adapter"] = report.adapter_report(modules, args.method, args.lora_r)
+        if torch.cuda.is_available():
+            metrics["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2)
+        report.write_metrics(metrics_path, metrics)
+        ad = metrics["adapter"]
+        print(f"\n{args.method.upper()} DONE | ROUGE-L {results['rougeL']:.2f} | EM {results['exact_match']:.2f}")
+        print(f"  adapter mem {ad['adapter_memory_mb']:.3f} MB | inference FLOPs/token {ad['adapter_inference_flops_per_token']:,} "
+              f"(x{ad['adapter_flops_x_one_rank_r']} one rank-{args.lora_r}) | "
+              f"deployed rank tot {ad['deployed_rank_total']} | peak VRAM {metrics.get('peak_vram_mb')} MB")
+
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e).lower():
+            raise   # a real bug, not OOM -> surface it
+        print(f"\n[OOM] {args.method} order_seed={args.order_seed} ended early at "
+              f"task {metrics['tasks_done']}/{len(tasks)} -- ending this run cleanly.")
+        metrics["status"] = "oom"
+        metrics["error"] = str(e)[:300]
+        if torch.cuda.is_available():
+            metrics["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2)
+            torch.cuda.empty_cache()
+        report.write_metrics(metrics_path, metrics)
+        import sys
+        sys.exit(0)   # clean exit so the experiment loop proceeds to the next run
 
 
 if __name__ == "__main__":

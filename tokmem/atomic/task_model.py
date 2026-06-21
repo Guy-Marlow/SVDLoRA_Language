@@ -64,25 +64,22 @@ class TaskCallingModel(nn.Module):
         
         # Get original embedding parameters for initialization
         original_embeddings = self.model.model.embed_tokens.weight.data
-        
-        # Create trainable parameters for task tokens (coupled or decoupled)
-        # Clone the embeddings for the reserved tokens and make them parameters
-        # Pre-create tensor for efficiency and reuse
         self.reserved_token_tensor = torch.tensor(self.reserved_token_ids, device=device)
-        
+
+        # PAPER-FAITHFUL INIT (TokMem §Training Details, Hewitt 2021): initialize each new
+        # procedure-token embedding to the MEAN of the pretrained input embeddings (NOT a clone
+        # of the arbitrary reserved-slot placeholder). Sequential per-task training then
+        # differentiates each token (it only sees its own task's data).
+        mean_emb = original_embeddings.mean(dim=0, keepdim=True)           # [1, hidden]
+        init_emb = mean_emb.repeat(self.num_tasks, 1).clone()             # [num_tasks, hidden]
+
         if self.decouple_embeddings:
             # Separate parameters for input and output layers
-            self.trainable_task_input_embeddings = nn.Parameter(
-                original_embeddings[self.reserved_token_tensor].clone()
-            )
-            self.trainable_task_output_embeddings = nn.Parameter(
-                original_embeddings[self.reserved_token_tensor].clone()
-            )
+            self.trainable_task_input_embeddings = nn.Parameter(init_emb.clone())
+            self.trainable_task_output_embeddings = nn.Parameter(init_emb.clone())
         else:
             # Shared parameter for both input and output layers
-            self.trainable_task_embeddings = nn.Parameter(
-                original_embeddings[self.reserved_token_tensor].clone()
-            )
+            self.trainable_task_embeddings = nn.Parameter(init_emb)
             # Create aliases for backward compatibility
             self.trainable_task_input_embeddings = self.trainable_task_embeddings
             self.trainable_task_output_embeddings = self.trainable_task_embeddings
@@ -394,6 +391,22 @@ class TaskCallingModel(nn.Module):
         else:
             return [self.trainable_task_embeddings]
     
+    @torch.no_grad()
+    def renormalize(self, idx, existing_indices, eps=1e-8):
+        """Paper §2.4 (Eqs 5-6): rescale the newly-trained procedure token `idx` to the
+        bank's typical norm -- n_bar = mean over already-trained tokens of ||m_j||, then
+        m_idx <- m_idx * n_bar / (||m_idx|| + eps). Prevents new tokens from norm-inflating
+        and dominating the routing logits (which suppresses retrieval of older tokens).
+        `existing_indices` = indices of tokens trained BEFORE this one (the current bank)."""
+        if not existing_indices:
+            return  # first task: no bank to match
+        def _rescale(emb):
+            n_bar = emb.data[existing_indices].norm(dim=1).mean()
+            emb.data[idx] = emb.data[idx] * (n_bar / (emb.data[idx].norm() + eps))
+        _rescale(self.trainable_task_input_embeddings)
+        if self.decouple_embeddings:
+            _rescale(self.trainable_task_output_embeddings)
+
     def save_task_tokens(self, filepath):
         """Save trained task token embeddings to file"""
         save_data = {
