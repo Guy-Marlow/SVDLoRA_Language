@@ -19,6 +19,9 @@ python scripts/prefetch_models.py --models 3B
 echo "[3/3] fetching Super-NaturalInstructions into ./data ..."
 python scripts/data_prep.py
 
+# SBATCH opens --output (under run_logs/) before the job script runs, so it must pre-exist.
+mkdir -p tokmem/atomic/run_logs
+
 echo
 echo "Setup complete."
 echo "  NI tasks:  data/natural-instructions-2.8/tasks  (atomic harness reads it via the relative symlink)"
