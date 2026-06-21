@@ -225,6 +225,9 @@ def main():
                     _mask = torch.zeros(model.num_tasks, 1, device=_p.device, dtype=_p.dtype)
                     _mask[idx] = 1.0
                     _hooks.append(_p.register_hook(lambda g, m=_mask: g * m))
+                # INCREMENTAL VOCAB (paper): only tokens added so far compete in the routing
+                # softmax during this task's training (trained set + the current token).
+                model.set_active_tasks(trained + [idx])
                 try:
                     train_task_calling_model(
                         model=model, dataloader=task_loader, val_dataloader=None,
@@ -234,6 +237,7 @@ def main():
                 finally:
                     for _h in _hooks:
                         _h.remove()
+                    model.clear_active_tasks()   # eval / renorm see the full bank
                 if args.renorm:
                     model.renormalize(idx, trained, eps=args.renorm_eps)  # rescale to bank norm
                 trained.append(idx)

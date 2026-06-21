@@ -91,7 +91,13 @@ class TaskCallingModel(nn.Module):
         
         # Task token mappings (using reserved tokens)
         self.task_id_to_token_id = {i: self.reserved_token_ids[i] for i in range(self.num_tasks)}
-        self.token_id_to_task_id = {self.reserved_token_ids[i]: i for i in range(self.num_tasks)} 
+        self.token_id_to_task_id = {self.reserved_token_ids[i]: i for i in range(self.num_tasks)}
+
+        # Incremental vocabulary (paper): during task t's training only the tokens added so far
+        # are in the bank. None => all tokens active (eval / default). Otherwise the routing
+        # logits of not-yet-added tokens are masked to -inf so they don't pollute the softmax.
+        self.active_task_indices = None
+        self._inactive_task_mask = None
 
         # Override the model's forward method to use our custom embeddings and logits
         self._setup_model_override()
@@ -126,10 +132,14 @@ class TaskCallingModel(nn.Module):
             # Efficiently replace reserved token logits using batch matmul
             # Shape: hidden_states (..., hidden_dim), task_embeddings (num_tasks, hidden_dim)
             task_logits = torch.matmul(hidden_states, self.trainable_task_output_embeddings.T)  # (..., num_tasks)
-            
+
+            # Incremental vocab: mask not-yet-added tokens out of the routing softmax.
+            if self._inactive_task_mask is not None:
+                task_logits = task_logits.masked_fill(self._inactive_task_mask, float('-inf'))
+
             # Replace the specific reserved token positions with our computed logits
             logits[..., self.reserved_token_tensor] = task_logits
-            
+
             return logits
         
         # Apply overrides
@@ -391,6 +401,19 @@ class TaskCallingModel(nn.Module):
         else:
             return [self.trainable_task_embeddings]
     
+    def set_active_tasks(self, indices):
+        """Restrict the routing softmax to `indices` (tokens added so far). Used during
+        sequential training so not-yet-added tokens don't pollute the competition."""
+        self.active_task_indices = list(indices)
+        mask = torch.ones(self.num_tasks, dtype=torch.bool, device=self.device)
+        mask[torch.tensor(self.active_task_indices, device=self.device, dtype=torch.long)] = False
+        self._inactive_task_mask = mask   # True = inactive -> masked to -inf
+
+    def clear_active_tasks(self):
+        """All tokens active (eval / deployment)."""
+        self.active_task_indices = None
+        self._inactive_task_mask = None
+
     @torch.no_grad()
     def renormalize(self, idx, existing_indices, eps=1e-8):
         """Paper §2.4 (Eqs 5-6): rescale the newly-trained procedure token `idx` to the
