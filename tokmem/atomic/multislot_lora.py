@@ -42,6 +42,17 @@ class MultiSlotLoRALinear(nn.Module):
         self.lora_B = nn.ParameterList()   # each [out, r]
         self.collect_cov = collect_cov
         self.collect = False
+        # --- weight-folding state ---
+        # Frozen adapters are pre-summed into ONE dense delta (fp32, [out,in], O(1) in #tasks) so
+        # the forward applies them as a single matmul instead of a per-adapter Python loop. The one
+        # current (trainable) adapter stays a live low-rank branch. This is the paper's "merge past
+        # adapters into W"; it is mathematically identical to the original sum over all adapters
+        # whenever dropout is off (always true at eval) -- see smoke_fold_test.py.
+        self.register_buffer("frozen_delta",
+                             torch.zeros(self.out_features, self.in_features, dtype=torch.float32,
+                                         device=base_linear.weight.device))
+        self._cur_idx = None
+        self._has_frozen = False
         if collect_cov:
             self.register_buffer("cur_matrix",
                                  torch.zeros(self.in_features, self.in_features, dtype=torch.float32,
@@ -64,12 +75,26 @@ class MultiSlotLoRALinear(nn.Module):
         if self.collect and self.collect_cov:
             xf = x.reshape(-1, self.in_features).float()
             self.cur_matrix += xf.t() @ xf
-        for A, B in zip(self.lora_A, self.lora_B):
+        # frozen adapters: one pre-merged dense matmul (deterministic, no dropout -- the paper's
+        # "merge past adapters into W"). O(1) in #tasks instead of a K-branch Python loop.
+        if self._has_frozen:
+            out = out + (x.to(self.frozen_delta.dtype) @ self.frozen_delta.t()).to(out.dtype)
+        # the single current (trainable) adapter: live low-rank branch, with dropout, exactly as before.
+        if self._cur_idx is not None and self._cur_idx < self.n_tasks:
+            A, B = self.lora_A[self._cur_idx], self.lora_B[self._cur_idx]
             out = out + self.scale * ((self.drop(x) @ A.t()) @ B.t())
         return out
 
     def set_trainable(self, task_idx, train_a=True):
-        """Freeze every slot, then enable slot task_idx (A only if train_a)."""
+        """Enable slot task_idx (A only if train_a), freeze the rest. The slot leaving the
+        'current' position is folded into frozen_delta (incremental, O(1) per task); in
+        O-LoRA/InfLoRA a frozen adapter is never modified again, so the fold is exact."""
+        if self._cur_idx is not None and self._cur_idx != task_idx and self._cur_idx < self.n_tasks:
+            with torch.no_grad():
+                self.frozen_delta += self.scale * (self.lora_B[self._cur_idx].to(self.frozen_delta.dtype)
+                                                   @ self.lora_A[self._cur_idx].to(self.frozen_delta.dtype))
+            self._has_frozen = True
+        self._cur_idx = task_idx
         for i in range(self.n_tasks):
             self.lora_A[i].requires_grad_(i == task_idx and train_a)
             self.lora_B[i].requires_grad_(i == task_idx)
