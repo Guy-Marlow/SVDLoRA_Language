@@ -43,6 +43,7 @@ from svdlora_layer import (
     inject_svdlora,
     svdlora_trainable_parameters,
     compress_all,
+    stash_all,
 )
 from multislot_lora import (
     inject_multislot_lora,
@@ -145,10 +146,20 @@ def build_loader(samples, tokenizer, args, shuffle):
                       collate_fn=lambda b: svd_collate_fn(b, tokenizer))
 
 
-def train_one_task(model, trainable_params, loader, args, extra_loss_fn=None):
-    """Fresh optimiser, constant LR (matches baseline: AdamW, no scheduler), N epochs.
-    extra_loss_fn() (e.g. O-LoRA's orthogonality penalty) is added to each step's loss."""
-    optim = torch.optim.AdamW(trainable_params, lr=args.lr)
+def train_one_task(model, trainable_params, loader, args, extra_loss_fn=None, optim=None):
+    """Constant LR (matches baseline: AdamW, no scheduler), N epochs.
+    extra_loss_fn() (e.g. O-LoRA's orthogonality penalty) is added to each step's loss.
+    If `optim` is given it is reused (persistent Adam momentum across tasks); otherwise a
+    fresh optimiser is built. Returns the optimiser so callers can persist it."""
+    # Reference TokMem LoRA baseline (main_lora_baseline.py) divides BOTH the loss and the
+    # LR by grad_accum -- a double 1/G. Under Adam only the lr/G bites (Adam is invariant to
+    # the loss/G magnitude scaling), so the reference's effective Adam LR is lr/grad_accum.
+    # Our default does loss/G only (line below in the step loop) and leaves the LR alone.
+    # --ref_lr_div replicates the reference exactly so we can faithfully reproduce its
+    # bs1/ga4 effective LR (and its sequence-weighted gradient when batch_size=1).
+    eff_lr = args.lr / args.gradient_accumulation_steps if args.ref_lr_div else args.lr
+    if optim is None:
+        optim = torch.optim.AdamW(trainable_params, lr=eff_lr)
     model.train()
     for epoch in range(args.num_epochs):
         optim.zero_grad()
@@ -160,6 +171,7 @@ def train_one_task(model, trainable_params, loader, args, extra_loss_fn=None):
             (loss / args.gradient_accumulation_steps).backward()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optim.step(); optim.zero_grad()
+    return optim
 
 
 def main():
@@ -177,7 +189,12 @@ def main():
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--eval_batch_size', type=int, default=16)
     p.add_argument('--gradient_accumulation_steps', type=int, default=1)
-    p.add_argument('--lr', type=float, default=5e-5)          # effective LR; no division
+    p.add_argument('--lr', type=float, default=5e-5)          # effective LR; no division (unless --ref_lr_div)
+    p.add_argument('--ref_lr_div', action='store_true',
+                   help="replicate reference grad-accum LR division: effective LR = lr / grad_accum")
+    p.add_argument('--persist_optimizer', action='store_true',
+                   help="retain a single AdamW across all tasks (persistent Adam momentum) "
+                        "instead of building a fresh optimiser per task")
     p.add_argument('--device', default="cuda")
     p.add_argument('--seed', type=int, default=42)
     # experiment ordering: fixed task set (set_seed) permuted per run (order_seed).
@@ -194,6 +211,7 @@ def main():
     # sketch HPs (svdlora)
     p.add_argument('--svd_rank', type=int, default=8)        # r_hat (fixed-rank mode)
     p.add_argument('--svd_oversampling', type=int, default=10)
+    p.add_argument('--svd_period', type=int, default=1)
     # adaptive-rank mode: keep smallest rank retaining (1 - eps) energy each task.
     # None/unset => original fixed-rank path. e.g. 0.01 keeps 99% energy.
     p.add_argument('--svd_energy_target', type=float, default=None)
@@ -214,7 +232,7 @@ def main():
     set_random_seed(args.seed)
     print("=" * 60)
     detail = {
-        'svdlora': f"P=1 compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}",
+        'svdlora': f"period P={args.svd_period} compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}",
         'seqlora': "single drifting adapter (no compression)",
         'olora':   f"per-task adapters, orth penalty lamda_1={args.lamda_1} lamda_2={args.lamda_2}",
         'inflora': f"per-task adapters, DualGPM lamb={args.lamb} lame={args.lame}",
@@ -279,7 +297,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     _seed_tag = f"_s{args.order_seed}" if args.order_seed is not None else ""
     _tag = f"{args.svd_layers}_{args.num_tasks}t{_seed_tag}" + (
-        f"_adapt{args.svd_energy_target}" if args.svd_energy_target is not None else "")
+        f"_adapt{args.svd_energy_target}" if args.svd_energy_target is not None else "") + (
+        f"_P{args.svd_period}" if args.svd_period != 1 else "")
     svd_diag_path = f"{args.out_dir}/svdlora_diag_{args.method}_{_tag}.json"
     metrics_path = f"{args.out_dir}/metrics_{args.method}_{_tag}.json"
     metrics = {"method": args.method, "num_tasks": args.num_tasks, "order_seed": args.order_seed,
@@ -297,6 +316,7 @@ def main():
     if _mem_snap and torch.cuda.is_available():
         torch.cuda.memory._record_memory_history(max_entries=200000)
 
+    persist_optim = None   # reused across tasks only when --persist_optimizer
     try:
         for i, (task_name, samples) in enumerate(tasks):
             print(f"[task {i+1}/{len(tasks)}] {task_name}  ({len(samples)} samples)")
@@ -330,23 +350,35 @@ def main():
 
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
-            train_one_task(model, trainable, loader, args, extra_loss_fn=extra_loss)
+            persist_optim = train_one_task(model, trainable, loader, args,
+                                           extra_loss_fn=extra_loss,
+                                           optim=persist_optim if args.persist_optimizer else None)
+            if not args.persist_optimizer:
+                persist_optim = None
             if torch.cuda.is_available():
                 _alloc = torch.cuda.memory_allocated() / 1e9
                 _peak = torch.cuda.max_memory_allocated() / 1e9
                 print(f"[mem] task {i}: live_boundary={_alloc:.2f}GB  step_peak={_peak:.2f}GB", flush=True)
 
             if args.method == 'svdlora':
-                diag = compress_all(modules)   # P = 1
-                if diag is not None and args.svd_diag:   # diagnostics only when requested
-                    rec = {"task": i, **{k: diag[k] for k in
-                           ("retained_mean", "retained_min", "sigma_next_mean", "sigma_next_max",
-                            "fro_mean", "fro_max", "residual_fro_mean", "residual_fro_max",
-                            "r_hat_mean", "r_hat_max", "r_hat_total")},
-                           "r_hat_per_module": diag.get("r_hat")}
-                    svd_diag_records.append(rec)
-                    with open(svd_diag_path, "w") as f:
-                        json.dump(svd_diag_records, f, indent=2)
+                # Sketch period: within a period each task trains an INDEPENDENT adapter over
+                # W+sketch (see svdlora_layer); we stash it and only fold the whole period into
+                # the sketch at a boundary. Always compress on the final task so the deployed
+                # sketch contains every task.
+                boundary = ((i + 1) % args.svd_period == 0) or (i + 1 == len(tasks))
+                if boundary:
+                    diag = compress_all(modules)
+                    if diag is not None and args.svd_diag:   # diagnostics only when requested
+                        rec = {"task": i, **{k: diag[k] for k in
+                               ("retained_mean", "retained_min", "sigma_next_mean", "sigma_next_max",
+                                "fro_mean", "fro_max", "residual_fro_mean", "residual_fro_max",
+                                "r_hat_mean", "r_hat_max", "r_hat_total")},
+                               "r_hat_per_module": diag.get("r_hat")}
+                        svd_diag_records.append(rec)
+                        with open(svd_diag_path, "w") as f:
+                            json.dump(svd_diag_records, f, indent=2)
+                else:
+                    stash_all(modules)
             elif args.method == 'inflora':
                 collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
                 feature_mat = update_dualgpm(q_modules, feature_list, project_type, i, len(tasks),

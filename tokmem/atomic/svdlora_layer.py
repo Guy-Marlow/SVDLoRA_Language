@@ -101,6 +101,14 @@ class SVDLoRALinear(nn.Module):
         self.register_buffer("sketch_B", torch.zeros(self.out_features, r_hat, dtype=dtype, device=device))
         self.register_buffer("sketch_A", torch.zeros(r_hat, self.in_features, dtype=dtype, device=device))
 
+        # Sketch-period support: with period P>1, the completed INDEPENDENT per-task adapters
+        # of the current period are stashed here (NOT applied in forward) until the next
+        # boundary folds them all into the sketch. Each was trained as a delta over W+sketch,
+        # never over each other. _period_adapters = how many are folded at the next compress
+        # (= len(stash)+1, the current residual), used as the adaptive rank budget.
+        self._stash_A, self._stash_B = [], []
+        self._period_adapters = 1
+
     def forward(self, x):
         out = self.base(x)
         # sketch term (scale = 1; effective delta is baked into the factors)
@@ -115,20 +123,37 @@ class SVDLoRALinear(nn.Module):
         self.lora_B.zero_()
 
     @torch.no_grad()
+    def stash_task(self):
+        """End a NON-boundary task within a period: store this task's (independent) adapter
+        for the next compression and reset the residual, so the next task trains a fresh
+        delta over W+sketch without seeing this one."""
+        self._stash_A.append(self.lora_A.detach().clone())
+        self._stash_B.append(self.lora_B.detach().clone())
+        self.reset_residual()
+
+    @torch.no_grad()
     def compress(self):
-        """Fold residual into the sketch via rand_svd, then reset the residual."""
+        """Sketch boundary: fold the prior sketch + this period's INDEPENDENT per-task
+        adapters (stashed + current residual, summed) into a new sketch via rand_svd, then
+        clear the period stash and reset the residual."""
         dtype = self.sketch_B.dtype
         resid = self.scale * (self.lora_B.float() @ self.lora_A.float())
         if self.diag:
             # this task's residual contribution norm (diagnostic)
             self.last_residual_fro = resid.norm().item()
-        dW = self.sketch_B.float() @ self.sketch_A.float() + resid
+        # sum of the period's independent adapters: current residual + any stashed ones
+        period_delta = resid
+        for A_j, B_j in zip(self._stash_A, self._stash_B):
+            period_delta = period_delta + self.scale * (B_j.float() @ A_j.float())
+        self._period_adapters = len(self._stash_A) + 1   # rank budget for adaptive
+        dW = self.sketch_B.float() @ self.sketch_A.float() + period_delta
 
         if self.energy_target is None:
             self._compress_fixed(dW, dtype)
         else:
             self._compress_adaptive(dW, dtype)
         self.last_r_hat = self.r_hat
+        self._stash_A, self._stash_B = [], []
         self.reset_residual()
 
     def _compress_fixed(self, dW, dtype):
@@ -146,10 +171,10 @@ class SVDLoRALinear(nn.Module):
 
     def _compress_adaptive(self, dW, dtype):
         """Adaptive-rank compression: keep the smallest rank retaining
-        (1 - energy_target) of the energy.  rank(dW) <= r_hat + r, so one
+        (1 - energy_target) of the energy.  rank(dW) <= r_hat + (period adapters)*r, so one
         randomized SVD to that bound gives the EXACT spectrum -- the target rank
         is then a cumsum on those singular values (no separate full SVD)."""
-        max_rank = min(self.sketch_B.shape[1] + self.r, min(dW.shape))
+        max_rank = min(self.sketch_B.shape[1] + self._period_adapters * self.r, min(dW.shape))
         B_full, A_full, S = rand_svd(dW, max_rank, self.oversampling,
                                      return_singular_values=True)
         e = S.pow(2); tot = e.sum()
@@ -218,6 +243,12 @@ def svdlora_trainable_parameters(modules):
     for m in modules:
         params += [m.lora_A, m.lora_B]
     return params
+
+
+def stash_all(modules):
+    """Non-boundary task within a period: stash each module's adapter, reset its residual."""
+    for m in modules:
+        m.stash_task()
 
 
 def compress_all(modules):
