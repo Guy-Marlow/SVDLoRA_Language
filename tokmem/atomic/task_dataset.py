@@ -272,6 +272,7 @@ def sample_natural_instructions_tasks(
     few_shot: bool = False,
     set_seed: Optional[int] = None,
     order_seed: Optional[int] = None,
+    min_instances: int = 0,
 ):
     """Sample a few tasks from Natural Instructions dataset and split with absolute sizes per task
     
@@ -296,8 +297,9 @@ def sample_natural_instructions_tasks(
     #   order_seed=None  -> original hierarchical global-RNG shuffle (backward compatible)
     #   order_seed set   -> FIXED set (set_seed) then per-run permutation (order_seed)
     from task_order import english_task_files, ordered_task_names
-    eng = english_task_files(tasks_dir)
-    print(f"✅ Found {len(eng)} English-only tasks")
+    eng = english_task_files(tasks_dir, min_instances=min_instances)
+    print(f"✅ Found {len(eng)} English-only tasks"
+          + (f" with >={min_instances} instances" if min_instances else ""))
     if len(eng) < num_tasks:
         print(f"Warning: Only {len(eng)} English tasks found, using all of them")
         num_tasks = len(eng)

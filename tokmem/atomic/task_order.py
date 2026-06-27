@@ -26,8 +26,12 @@ import random
 DEFAULT_SET_SEED = 0   # constant -> the fixed 1000-task set is the same for every run
 
 
-def english_task_files(tasks_dir):
-    """Sorted list of task json filenames whose input AND output languages are English."""
+def english_task_files(tasks_dir, min_instances=0):
+    """Sorted list of task json filenames whose input AND output languages are English.
+
+    min_instances>0 additionally requires the task to have at least that many Instances
+    (used to fix a pool of tasks large enough for a given train+val+test footprint, e.g.
+    min_instances=560 for train 500 / val 10 / test 50). Backward compatible (default 0)."""
     if not os.path.exists(tasks_dir):
         raise FileNotFoundError(f"Tasks directory not found: {tasks_dir}")
     out = []
@@ -40,18 +44,22 @@ def english_task_files(tasks_dir):
         except Exception:
             continue
         il, ol = d.get("Input_language", []), d.get("Output_language", [])
-        if ("English" in il or il == ["English"]) and ("English" in ol or ol == ["English"]):
-            out.append(fn)
+        if not (("English" in il or il == ["English"]) and ("English" in ol or ol == ["English"])):
+            continue
+        if min_instances and len(d.get("Instances", [])) < min_instances:
+            continue
+        out.append(fn)
     return sorted(out)
 
 
 def ordered_task_names(tasks_dir, num_tasks, set_seed=DEFAULT_SET_SEED, order_seed=None,
-                       english_files=None):
+                       english_files=None, min_instances=0):
     """Return the ordered list of task json filenames for a run.
 
     english_files: optional precomputed list from english_task_files() to avoid re-scanning.
+    min_instances: only used when english_files is None (forwarded to english_task_files).
     """
-    files = english_files if english_files is not None else english_task_files(tasks_dir)
+    files = english_files if english_files is not None else english_task_files(tasks_dir, min_instances)
     files = sorted(files)
     n = min(num_tasks, len(files))
     if order_seed is None:
