@@ -131,12 +131,24 @@ def trainable_parameters(modules):
 
 # ----------------------- O-LoRA penalty -----------------------
 def orthogonality_penalty(modules, cur_task):
-    """sum_modules sum_{s<t} | A_t @ A_s^T |.sum()  (current vs frozen previous)."""
+    """sum_modules sum_{s<t} | A_t @ A_s^T |.sum()  (current vs frozen previous).
+
+    Vectorised: the frozen A_{<t} of a module are stacked into one [t*r, in] matrix and the
+    cross-product is a SINGLE matmul per module, then one abs().sum(). This is numerically
+    identical to the per-pair double loop (|[B_0|B_1|...]|.sum() == sum_s |B_s|.sum()) but
+    replaces O(modules * t) tiny GPU kernels per training step with O(modules) -- a large
+    speedup at high task counts (the old loop dominated O-LoRA's wall time). The stacked
+    frozen block is cached per task on the module (A_{<t} don't change while task t trains).
+    """
+    if cur_task == 0:
+        return 0.0
     orth = 0.0
     for m in modules:
-        A_t = m.lora_A[cur_task]
-        for s in range(cur_task):
-            orth = orth + torch.abs(A_t @ m.lora_A[s].t()).sum()
+        # (re)build the cached stack of frozen previous A's when the task advances
+        if getattr(m, "_orth_prev_task", None) != cur_task:
+            m._orth_prev = torch.cat([m.lora_A[s].detach() for s in range(cur_task)], dim=0)
+            m._orth_prev_task = cur_task
+        orth = orth + torch.abs(m.lora_A[cur_task] @ m._orth_prev.t()).sum()
     return orth
 
 
