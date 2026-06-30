@@ -102,17 +102,28 @@ run_one() {
   echo "==== DONE  [gpu ${gpu}] ${LABEL} $(date) ===="
 }
 
-# 2-slot pool: GPU 0 takes even-index entries, GPU 1 odd-index. Each worker runs its half
-# sequentially; `wait` blocks until the 120h wall (or both finish).
+# GPU-count-aware pool. With NGPU slots, worker g handles entries g, g+NGPU, g+2*NGPU, ...
+# so each GPU runs its share sequentially. On ONE GPU this collapses to a single worker
+# walking ALL entries strictly one-at-a-time (no two jobs share a card -> no OOM/contention,
+# which is the fastest safe option on a single GPU). The priority-first/seed-major ordering
+# means the unfinished Qwen-1995 set and then a COMPLETE Llama-1993 sweep land first if the
+# wall is hit before all 24 finish (likely on a single card).
+NGPU="${SLURM_GPUS_ON_NODE:-}"
+[ -z "$NGPU" ] && NGPU="$(nvidia-smi -L 2>/dev/null | wc -l)"
+case "$NGPU" in (''|*[!0-9]*) NGPU=1 ;; esac   # non-numeric/empty -> 1
+[ "$NGPU" -lt 1 ] && NGPU=1
+echo "==== using NGPU=${NGPU} slot(s); ${#RUNS[@]} runs total $(date) ===="
+
 worker() {
-  local gpu="$1" start="$2"
+  local gpu="$1"
   local i
-  for (( i=start; i<${#RUNS[@]}; i+=2 )); do
+  for (( i=gpu; i<${#RUNS[@]}; i+=NGPU )); do
     run_one "$gpu" "${RUNS[$i]}"
   done
 }
 
-worker 0 0 &
-worker 1 1 &
+for (( g=0; g<NGPU; g++ )); do
+  worker "$g" &
+done
 wait
 echo "ALL ASSIGNED RUNS COMPLETE (or wall reached) $(date)"
