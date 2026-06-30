@@ -170,7 +170,8 @@ def main():
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
             "svd_energy_target": args.svd_energy_target if args.method == 'svdlora' else None,
             "lamda_1": args.lamda_1 if args.method == 'olora' else None,
-            "eval_every_tasks": args.eval_every_tasks, "status": "running", "checkpoints": []}
+            "eval_every_tasks": args.eval_every_tasks, "status": "running",
+            "per_task_train_seconds": [], "checkpoints": []}
     report.write_metrics(out_path, meta)
 
     # ---- chunk machinery (a "chunk" = the span between two boundaries) ----
@@ -200,9 +201,10 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     train_seconds = 0.0
+    last_ckpt_train_seconds = 0.0   # train_seconds at the previous checkpoint (for per-interval delta)
 
     def do_eval(tasks_seen):
-        nonlocal train_seconds
+        nonlocal train_seconds, last_ckpt_train_seconds
         seen = [ex for grp in ordered_test[:tasks_seen] for ex in grp]
         model.eval()
         t0 = time.time()
@@ -212,13 +214,19 @@ def main():
         eval_s = time.time() - t0
         model.train()
         rank, byts, flops = deployed_now(modules, args.method, args.lora_r)
+        n_seen = max(len(seen), 1)
+        train_delta = train_seconds - last_ckpt_train_seconds
+        last_ckpt_train_seconds = train_seconds
         rec = {"tasks_seen": tasks_seen, "n_test": len(seen),
                "samples_trained": state.get("samples", 0), "n_boundaries": state["n_boundaries"],
                "rougeL": results.get("rougeL"), "exact_match": results.get("exact_match"),
                "deployed_rank_total": rank, "adapter_mb": round(byts / 1024 / 1024, 4),
                "inference_flops_per_token": flops,
                "train_seconds_cumulative": round(train_seconds, 1),
+               "train_seconds_interval": round(train_delta, 1),
                "eval_seconds": round(eval_s, 1),
+               "inference_seconds_per_example": round(eval_s / n_seen, 4),
+               "inference_ms_per_example": round(1000.0 * eval_s / n_seen, 2),
                "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1)
                if torch.cuda.is_available() else None,
                "per_task": results.get("per_task")}
@@ -235,6 +243,7 @@ def main():
         next_boundary = B
         for ti, (task_name, samples) in enumerate(train_tasks):
             loader = build_loader(samples, tokenizer, args, shuffle=True)
+            task_train_seconds = 0.0      # wall-clock of this task's single epoch
             for batch in loader:
                 t0 = time.time()
                 batch = {k: v.to(args.device) for k, v in batch.items()}
@@ -245,11 +254,14 @@ def main():
                 state["optim"].step(); state["optim"].zero_grad()
                 samples_seen += batch["input_ids"].size(0)
                 state["samples"] = samples_seen
-                train_seconds += time.time() - t0
+                dt = time.time() - t0
+                train_seconds += dt
+                task_train_seconds += dt
                 # sample-mode boundary may fire mid-task
                 if args.boundary_mode == 'sample' and samples_seen >= next_boundary:
                     end_chunk(); begin_chunk()
                     next_boundary += B
+            meta["per_task_train_seconds"].append(round(task_train_seconds, 2))
             if args.boundary_mode == 'task':
                 end_chunk()
             # cumulative eval at task increments (learner unaware in sample mode)
