@@ -215,6 +215,12 @@ def main():
     # adaptive-rank mode: keep smallest rank retaining (1 - eps) energy each task.
     # None/unset => original fixed-rank path. e.g. 0.01 keeps 99% energy.
     p.add_argument('--svd_energy_target', type=float, default=None)
+    p.add_argument('--svd_warmup_fixed_rank', type=int, default=None,
+                   help="warm-up: compress to this FIXED target rank for the first "
+                        "--svd_warmup_tasks tasks (lossless while raw rank < it), then switch "
+                        "to the adaptive --svd_energy_target path. e.g. 160")
+    p.add_argument('--svd_warmup_tasks', type=int, default=0,
+                   help="number of initial tasks to use the fixed warm-up rank before adaptive")
     # per-task retained-energy diagnostics (extra full SVD/module/task -> EXPENSIVE). OFF for real runs.
     p.add_argument('--svd_diag', action='store_true')
     # O-LoRA HPs
@@ -223,10 +229,34 @@ def main():
     # InfLoRA / DualGPM HPs
     p.add_argument('--lamb', type=float, default=0.95)       # threshold lower bound
     p.add_argument('--lame', type=float, default=1.0)        # threshold upper bound
+    # InfLoRA ablation: disable the data-aligned analytical (DualGPM null-space) A init.
+    # A is left at its random kaiming init and frozen; only B trains (InfLoRA's bank
+    # structure preserved). Isolates whether InfLoRA's edge is the data-alignment or just
+    # the frozen-A/trained-B per-task bank. No covariance collection / no null-space growth.
+    p.add_argument('--inflora_no_align', action='store_true')
     # memory: gradient checkpointing (exact; recompute activations in backward)
     p.add_argument('--gradient_checkpointing', action='store_true')
     # svdlora layer restriction: all blocks / bottom (low-level) / top (high-level) half
     p.add_argument('--svd_layers', choices=['all', 'bottom', 'top'], default='all')
+    # ---- forgetting probe ----
+    # Track the FIRST `forgetting_probe` trained tasks and re-evaluate their (fixed) test
+    # sets at several training checkpoints to measure catastrophic forgetting directly:
+    # if accuracy on those tasks is highest right after they are trained and decays as more
+    # tasks are learned, forgetting is occurring. 0 = off (default behaviour unchanged).
+    p.add_argument('--forgetting_probe', type=int, default=0,
+                   help='number of earliest-trained tasks to track for forgetting (e.g. 20)')
+    p.add_argument('--probe_checkpoints', default='20,40,60,80,100',
+                   help='comma list of #tasks-trained at which to re-eval the probe set; the '
+                        'final task is always added')
+    # restrict the sampling pool to English tasks with >= this many Instances (the
+    # 500/10/50 footprint needs >=560 -> the ~750-task long-horizon pool). 0 = all English.
+    p.add_argument('--min_instances', type=int, default=0)
+    # ---- per-task sketch-cost probe (adaptive SVDLoRA, period P=1) ----
+    # After training each task's residual, evaluate that task TWICE: once with the residual
+    # still live (W + B_hat A_hat + s B A)  -> the "ideal" pre-compression accuracy, and again
+    # after the residual is sketched into the frozen B_hat A_hat -> the deployed accuracy.
+    # The gap is exactly the per-task accuracy cost of the SVD sketch.
+    p.add_argument('--sketch_cost_probe', action='store_true')
     args = p.parse_args()
 
     set_random_seed(args.seed)
@@ -235,7 +265,9 @@ def main():
         'svdlora': f"period P={args.svd_period} compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}",
         'seqlora': "single drifting adapter (no compression)",
         'olora':   f"per-task adapters, orth penalty lamda_1={args.lamda_1} lamda_2={args.lamda_2}",
-        'inflora': f"per-task adapters, DualGPM lamb={args.lamb} lame={args.lame}",
+        'inflora': (f"per-task adapters, RANDOM frozen-A (DualGPM align DISABLED), train B only"
+                    if args.inflora_no_align else
+                    f"per-task adapters, DualGPM lamb={args.lamb} lame={args.lame}"),
     }[args.method]
     print(f"{args.method.upper()} for Natural Instructions (atomic recall)")
     print(f"Model: {args.model_name} | tasks: {args.num_tasks} | {detail}")
@@ -252,7 +284,8 @@ def main():
         max_instruction_tokens=args.max_instruction_tokens, tokenizer=tokenizer,
         stable_test_split=True, train_size=args.train_size,
         val_size=args.val_size, test_size=args.test_size, few_shot=False,
-        set_seed=args.set_seed, order_seed=args.order_seed)
+        set_seed=args.set_seed, order_seed=args.order_seed,
+        min_instances=args.min_instances)
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16, device_map=args.device)
@@ -269,8 +302,8 @@ def main():
         # per-task adapters added lazily (grow one slot per task)
         modules = inject_multislot_lora(model, target_modules=targets, r=args.lora_r,
                                         alpha=args.lora_alpha, dropout=args.lora_dropout,
-                                        collect_cov=(args.method == 'inflora'))
-        if args.method == 'inflora':
+                                        collect_cov=(args.method == 'inflora' and not args.inflora_no_align))
+        if args.method == 'inflora' and not args.inflora_no_align:
             # q_proj/v_proj alternate per layer (q first); q is square (out==in), pair them
             pairs = list(zip(modules[0::2], modules[1::2]))
             assert pairs[0][0].out_features == pairs[0][0].in_features, "unexpected q/v order"
@@ -284,7 +317,9 @@ def main():
                                  r_hat=args.svd_rank, alpha=args.lora_alpha,
                                  oversampling=args.svd_oversampling, dropout=args.lora_dropout,
                                  layer_indices=layer_indices,
-                                 energy_target=args.svd_energy_target, diag=args.svd_diag)
+                                 energy_target=args.svd_energy_target, diag=args.svd_diag,
+                                 warmup_fixed_rank=args.svd_warmup_fixed_rank,
+                                 warmup_tasks=args.svd_warmup_tasks)
     print(f"Injected {len(modules)} adapter modules ({args.method}, svd_layers={args.svd_layers})")
 
     # InfLoRA DualGPM state (per-module)
@@ -298,7 +333,10 @@ def main():
     _seed_tag = f"_s{args.order_seed}" if args.order_seed is not None else ""
     _tag = f"{args.svd_layers}_{args.num_tasks}t{_seed_tag}" + (
         f"_adapt{args.svd_energy_target}" if args.svd_energy_target is not None else "") + (
-        f"_P{args.svd_period}" if args.svd_period != 1 else "")
+        f"_P{args.svd_period}" if args.svd_period != 1 else "") + (
+        f"_warm{args.svd_warmup_fixed_rank}x{args.svd_warmup_tasks}"
+        if args.svd_warmup_fixed_rank is not None else "") + (
+        "_noalign" if (args.method == 'inflora' and args.inflora_no_align) else "")
     svd_diag_path = f"{args.out_dir}/svdlora_diag_{args.method}_{_tag}.json"
     metrics_path = f"{args.out_dir}/metrics_{args.method}_{_tag}.json"
     metrics = {"method": args.method, "num_tasks": args.num_tasks, "order_seed": args.order_seed,
@@ -309,12 +347,39 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     svd_diag_records = []
+    # per-task sketch-cost probe records (svdlora only)
+    sketch_cost_records = []
+    sketch_cost_path = f"{args.out_dir}/sketchcost_{args.method}_{_tag}.json"
+    if args.sketch_cost_probe and args.method == 'svdlora' and args.svd_period != 1:
+        print("[sketch-cost] WARNING: probe assumes period P=1 (compress every task); "
+              f"svd_period={args.svd_period} -> 'ideal' includes stashed adapters.", flush=True)
 
     # opt-in (MEM_SNAPSHOT=1): record allocation call-stacks so an OOM dumps a
     # snapshot pinning exactly which tensors/call-sites hold the memory.
     _mem_snap = os.environ.get("MEM_SNAPSHOT") == "1"
     if _mem_snap and torch.cuda.is_available():
         torch.cuda.memory._record_memory_history(max_entries=200000)
+
+    # ---- forgetting probe setup ----
+    # The probe set = pooled test examples of the first `forgetting_probe` trained tasks
+    # (fixed across checkpoints). We re-evaluate it after the requested #tasks are trained.
+    probe_on = args.forgetting_probe > 0
+    probe_records = None
+    if probe_on:
+        n_probe = min(args.forgetting_probe, len(tasks))
+        probe_task_names = {tasks[k][0] for k in range(n_probe)}
+        probe_test = [ex for ex in test_data if ex['tasks'][0] in probe_task_names]
+        checkpoints = {int(c) for c in args.probe_checkpoints.split(',') if c.strip()}
+        checkpoints = {c for c in checkpoints if c <= len(tasks)}
+        checkpoints.add(len(tasks))   # always probe at completion
+        probe_records = {"method": args.method, "order_seed": args.order_seed,
+                         "seed": args.seed, "num_tasks": args.num_tasks,
+                         "n_probe_tasks": n_probe, "probe_tasks": sorted(probe_task_names),
+                         "checkpoints": sorted(checkpoints), "n_probe_examples": len(probe_test),
+                         "evals": {}}   # evals[checkpoint] = {"overall": x, "per_task": {...}}
+        probe_path = f"{args.out_dir}/forgetting_{args.method}_{_tag}.json"
+        print(f"[forgetting-probe] tracking {n_probe} tasks ({len(probe_test)} test ex) "
+              f"at checkpoints {sorted(checkpoints)} -> {probe_path}")
 
     persist_optim = None   # reused across tasks only when --persist_optimizer
     try:
@@ -328,9 +393,11 @@ def main():
 
             extra_loss = None
             if args.method == 'inflora':
-                # collect input covariance with the accumulated model, set A analytically, freeze A
-                collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
-                init_lora_A_dualgpm(pairs, feature_mat, project_type, i, args.lora_r, args.device)
+                if not args.inflora_no_align:
+                    # collect input covariance with the accumulated model, set A analytically, freeze A
+                    collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
+                    init_lora_A_dualgpm(pairs, feature_mat, project_type, i, args.lora_r, args.device)
+                # ablation: A stays at its random kaiming init (set in add_task); freeze A, train B only
                 for m in modules:
                     m.set_trainable(i, train_a=False)
                 trainable = multislot_trainable_parameters(modules)
@@ -367,7 +434,34 @@ def main():
                 # sketch contains every task.
                 boundary = ((i + 1) % args.svd_period == 0) or (i + 1 == len(tasks))
                 if boundary:
-                    diag = compress_all(modules)
+                    # ---- per-task sketch-cost probe: eval THIS task before vs after sketching ----
+                    if args.sketch_cost_probe:
+                        cur_test = [ex for ex in test_data if ex['tasks'][0] == task_name]
+                        ideal_res, _ = evaluate_with_generation(
+                            model=model, tokenizer=tokenizer, test_examples=cur_test,
+                            device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
+                        model.train()
+                    diag = compress_all(modules, task_idx=i)
+                    if args.sketch_cost_probe:
+                        # residual now folded into the frozen sketch + reset -> deployed state
+                        sketched_res, _ = evaluate_with_generation(
+                            model=model, tokenizer=tokenizer, test_examples=cur_test,
+                            device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
+                        model.train()
+                        ranks = [m.sketch_B.shape[1] for m in modules]
+                        rec_sc = {"task_idx": i, "task": task_name, "n_test": len(cur_test),
+                                  "ideal_rougeL": ideal_res["rougeL"], "sketched_rougeL": sketched_res["rougeL"],
+                                  "rougeL_drop": round(ideal_res["rougeL"] - sketched_res["rougeL"], 4),
+                                  "ideal_em": ideal_res["exact_match"], "sketched_em": sketched_res["exact_match"],
+                                  "em_drop": round(ideal_res["exact_match"] - sketched_res["exact_match"], 4),
+                                  "sketch_rank_total": int(sum(ranks)),
+                                  "sketch_rank_mean": round(sum(ranks) / len(ranks), 3)}
+                        sketch_cost_records.append(rec_sc)
+                        with open(sketch_cost_path, "w") as f:
+                            json.dump(sketch_cost_records, f, indent=2)
+                        print(f"[sketch-cost] task {i+1} {task_name}: ideal {ideal_res['rougeL']:.2f} "
+                              f"-> sketched {sketched_res['rougeL']:.2f} (drop {rec_sc['rougeL_drop']:+.2f}) "
+                              f"| sketch rank tot {rec_sc['sketch_rank_total']}", flush=True)
                     if diag is not None and args.svd_diag:   # diagnostics only when requested
                         rec = {"task": i, **{k: diag[k] for k in
                                ("retained_mean", "retained_min", "sigma_next_mean", "sigma_next_max",
@@ -379,7 +473,7 @@ def main():
                             json.dump(svd_diag_records, f, indent=2)
                 else:
                     stash_all(modules)
-            elif args.method == 'inflora':
+            elif args.method == 'inflora' and not args.inflora_no_align:
                 collect_covariance(model, q_modules, build_loader(samples, tokenizer, args, shuffle=False), args.device)
                 feature_mat = update_dualgpm(q_modules, feature_list, project_type, i, len(tasks),
                                              args.lamb, args.lame)
@@ -391,24 +485,84 @@ def main():
                     report.adapter_memory_bytes(modules, args.method) / 1024 / 1024, 4)})
                 report.write_metrics(metrics_path, metrics)
 
+            # ---- forgetting probe: re-eval the fixed first-N-task test set at checkpoints ----
+            # Runs on the DEPLOYED state of this task (after svdlora compression / inflora
+            # DualGPM update above), so it measures exactly what is deployed at task i+1.
+            if probe_on and (i + 1) in checkpoints:
+                _was_ckpt = args.gradient_checkpointing
+                if _was_ckpt:
+                    model.gradient_checkpointing_disable(); model.config.use_cache = True
+                pr, _ = evaluate_with_generation(
+                    model=model, tokenizer=tokenizer, test_examples=probe_test,
+                    device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
+                probe_records["evals"][i + 1] = {"overall": pr["rougeL"],
+                                                 "exact_match": pr.get("exact_match"),
+                                                 "per_task": pr.get("per_task", {})}
+                with open(probe_path, "w") as f:
+                    json.dump(probe_records, f, indent=2)
+                print(f"[forgetting-probe] after {i+1} tasks: probe ROUGE-L {pr['rougeL']:.2f} "
+                      f"(first {probe_records['n_probe_tasks']} tasks)", flush=True)
+                if _was_ckpt:
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False})
+                    model.config.use_cache = False
+                model.train()   # resume training mode for the next task
+
         # ---- evaluation: identical path to the LoRA baseline ----
         if args.gradient_checkpointing:
             model.gradient_checkpointing_disable()
             model.config.use_cache = True   # restore KV cache for fast generation
-        print("\nEvaluating (greedy generation, pooled test set, NI ROUGE-L)...")
-        results, _ = evaluate_with_generation(
-            model=model, tokenizer=tokenizer, test_examples=test_data,
-            device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
-        print_evaluation_results(results)
-        if "per_task" in results:
-            with open(f"{args.out_dir}/pertask_{args.method}_{_tag}.json", "w") as f:
-                json.dump(results["per_task"], f, indent=2)
+        if probe_on:
+            # The forgetting probe already ran the completion-checkpoint eval (the first-N
+            # tasks). Skip the full pooled eval so total eval cost stays ~one full eval.
+            print("\n[forgetting-probe] run complete; skipping full pooled eval.")
+            _final = probe_records["evals"].get(len(tasks), {})
+            results = {"rougeL": _final.get("overall"), "exact_match": _final.get("exact_match")}
+        else:
+            print("\nEvaluating (greedy generation, pooled test set, NI ROUGE-L)...")
+            results, _ = evaluate_with_generation(
+                model=model, tokenizer=tokenizer, test_examples=test_data,
+                device=args.device, max_new_tokens=256, batch_size=args.eval_batch_size)
+            print_evaluation_results(results)
+            if "per_task" in results:
+                with open(f"{args.out_dir}/pertask_{args.method}_{_tag}.json", "w") as f:
+                    json.dump(results["per_task"], f, indent=2)
 
         # ---- final performance report (memory / FLOPs / accuracy / peak VRAM) ----
         metrics["status"] = "done"
         metrics["rougeL"] = results["rougeL"]
         metrics["exact_match"] = results["exact_match"]
         metrics["adapter"] = report.adapter_report(modules, args.method, args.lora_r)
+        # MEASURE (via SVD) the actual numerical rank of the deployed adapter each method
+        # uses at inference -- nominal (sum of block ranks) vs measured, never conflated.
+        print("Measuring deployed-adapter rank (SVD per module)...", flush=True)
+        rank_meas = report.measure_deployed_rank(modules, args.method)
+        metrics["deployed_rank_measured"] = rank_meas
+        print(f"[deployed-rank] {args.method}: nominal_total={rank_meas['nominal_rank_total']} "
+              f"measured_total={rank_meas['measured_rank_total']} "
+              f"(exact={rank_meas['measured_rank_exact_total']}, "
+              f"E99={rank_meas['energy99_rank_total']}, E99.9={rank_meas['energy999_rank_total']}) | "
+              f"q_proj {rank_meas['q_proj']['shape']} cap{rank_meas['q_proj']['cap_each']} "
+              f"nominal{rank_meas['q_proj']['nominal_each']} measured~{rank_meas['q_proj']['measured_mean']} | "
+              f"v_proj {rank_meas['v_proj']['shape']} cap{rank_meas['v_proj']['cap_each']} "
+              f"nominal{rank_meas['v_proj']['nominal_each']} measured~{rank_meas['v_proj']['measured_mean']}",
+              flush=True)
+        # per-task sketch-cost summary (mean/max accuracy lost when the residual is sketched)
+        if sketch_cost_records:
+            drops = [r["rougeL_drop"] for r in sketch_cost_records]
+            ideals = [r["ideal_rougeL"] for r in sketch_cost_records]
+            skets = [r["sketched_rougeL"] for r in sketch_cost_records]
+            metrics["sketch_cost"] = {
+                "n_tasks": len(drops),
+                "mean_ideal_rougeL": round(sum(ideals) / len(ideals), 3),
+                "mean_sketched_rougeL": round(sum(skets) / len(skets), 3),
+                "mean_rougeL_drop": round(sum(drops) / len(drops), 3),
+                "max_rougeL_drop": round(max(drops), 3),
+                "records_file": os.path.basename(sketch_cost_path)}
+            print(f"[sketch-cost] mean ideal {metrics['sketch_cost']['mean_ideal_rougeL']:.2f} "
+                  f"-> mean sketched {metrics['sketch_cost']['mean_sketched_rougeL']:.2f} "
+                  f"(mean drop {metrics['sketch_cost']['mean_rougeL_drop']:+.2f}, "
+                  f"max {metrics['sketch_cost']['max_rougeL_drop']:+.2f})", flush=True)
         if torch.cuda.is_available():
             metrics["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 1024 / 1024, 2)
         report.write_metrics(metrics_path, metrics)

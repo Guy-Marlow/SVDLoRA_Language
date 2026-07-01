@@ -61,7 +61,8 @@ class SVDLoRALinear(nn.Module):
 
     def __init__(self, base_linear: nn.Linear, r: int, r_hat: int,
                  alpha: float, oversampling: int, dropout: float = 0.0,
-                 energy_target: float = None, diag: bool = False):
+                 energy_target: float = None, diag: bool = False,
+                 warmup_fixed_rank: int = None, warmup_tasks: int = 0):
         super().__init__()
         # diag: log per-task retained-energy/sigma diagnostics. For the FIXED-rank path this
         # needs an extra full svdvals(dW) per module per task -> EXPENSIVE; default OFF for real
@@ -80,6 +81,11 @@ class SVDLoRALinear(nn.Module):
         # growing the sketch only as much as the data's intrinsic rank demands.
         # None => the original fixed-rank-r_hat path (untouched).
         self.energy_target = energy_target
+        # warm-up: for the first `warmup_tasks` compressions, sketch with a FIXED target
+        # rank `warmup_fixed_rank` (lossless while the accumulated raw rank < that target),
+        # then switch to the adaptive energy_target path. None => warm-up disabled.
+        self.warmup_fixed_rank = warmup_fixed_rank
+        self.warmup_tasks = warmup_tasks
         self.scale = alpha / r                      # PEFT convention, matches baseline
         self.oversampling = oversampling
         self.last_retained = None         # retained-energy frac at last compress
@@ -132,10 +138,14 @@ class SVDLoRALinear(nn.Module):
         self.reset_residual()
 
     @torch.no_grad()
-    def compress(self):
+    def compress(self, task_idx=None):
         """Sketch boundary: fold the prior sketch + this period's INDEPENDENT per-task
         adapters (stashed + current residual, summed) into a new sketch via rand_svd, then
-        clear the period stash and reset the residual."""
+        clear the period stash and reset the residual.
+
+        `task_idx` (0-based index of the task just finished) selects warm-up vs adaptive:
+        while it is < warmup_tasks and a warmup_fixed_rank is set, compress to that fixed
+        rank (lossless padding while the raw rank is below it); afterwards use energy_target."""
         dtype = self.sketch_B.dtype
         resid = self.scale * (self.lora_B.float() @ self.lora_A.float())
         if self.diag:
@@ -148,7 +158,11 @@ class SVDLoRALinear(nn.Module):
         self._period_adapters = len(self._stash_A) + 1   # rank budget for adaptive
         dW = self.sketch_B.float() @ self.sketch_A.float() + period_delta
 
-        if self.energy_target is None:
+        in_warmup = (self.warmup_fixed_rank is not None and task_idx is not None
+                     and task_idx < self.warmup_tasks)
+        if in_warmup:
+            self._compress_fixed(dW, dtype, target_rank=self.warmup_fixed_rank)
+        elif self.energy_target is None:
             self._compress_fixed(dW, dtype)
         else:
             self._compress_adaptive(dW, dtype)
@@ -156,18 +170,22 @@ class SVDLoRALinear(nn.Module):
         self._stash_A, self._stash_B = [], []
         self.reset_residual()
 
-    def _compress_fixed(self, dW, dtype):
-        """Original fixed-rank-r_hat compression (behaviour unchanged)."""
+    def _compress_fixed(self, dW, dtype, target_rank=None):
+        """Fixed-rank compression. target_rank=None uses self.r_hat (original behaviour);
+        the warm-up path passes an explicit (larger) rank. The target is capped at the
+        matrix's own dimensions -- beyond the true rank the extra slots are zero-energy."""
+        rk = self.r_hat if target_rank is None else min(target_rank, min(dW.shape))
         if self.diag:
             # --- diagnostics on the pre-truncation accumulated ΔW (EXTRA full SVD) ---
             S = torch.linalg.svdvals(dW)                   # singular values, descending
             e = S.pow(2); tot = e.sum()
-            self.last_retained = (e[:self.r_hat].sum() / tot).item() if tot > 0 else 1.0
-            self.last_sigma_next = S[self.r_hat].item() if S.numel() > self.r_hat else 0.0
+            self.last_retained = (e[:rk].sum() / tot).item() if tot > 0 else 1.0
+            self.last_sigma_next = S[rk].item() if S.numel() > rk else 0.0
             self.last_fro = tot.sqrt().item()
-        B_hat, A_hat = rand_svd(dW, self.r_hat, self.oversampling)
-        self.sketch_B = B_hat.to(dtype)
-        self.sketch_A = A_hat.to(dtype)
+        B_hat, A_hat = rand_svd(dW, rk, self.oversampling)
+        self.sketch_B = B_hat.to(dtype).contiguous()
+        self.sketch_A = A_hat.to(dtype).contiguous()
+        self.r_hat = rk
 
     def _compress_adaptive(self, dW, dtype):
         """Adaptive-rank compression: keep the smallest rank retaining
@@ -206,7 +224,7 @@ def _layer_index_of(name):
 
 def inject_svdlora(model, target_modules=("q_proj", "v_proj"), r=8, r_hat=8,
                    alpha=32.0, oversampling=10, dropout=0.0, layer_indices=None,
-                   energy_target=None, diag=False):
+                   energy_target=None, diag=False, warmup_fixed_rank=None, warmup_tasks=0):
     """Replace each target nn.Linear in `model` with an SVDLoRALinear wrapper.
 
     Freezes every base parameter; only the residual lora_A/lora_B remain trainable.
@@ -232,7 +250,8 @@ def inject_svdlora(model, target_modules=("q_proj", "v_proj"), r=8, r_hat=8,
         base_linear = getattr(parent, child_name)
         wrapper = SVDLoRALinear(base_linear, r=r, r_hat=r_hat, alpha=alpha,
                                 oversampling=oversampling, dropout=dropout,
-                                energy_target=energy_target, diag=diag)
+                                energy_target=energy_target, diag=diag,
+                                warmup_fixed_rank=warmup_fixed_rank, warmup_tasks=warmup_tasks)
         setattr(parent, child_name, wrapper)
         inserted.append(wrapper)
     return inserted
@@ -251,9 +270,9 @@ def stash_all(modules):
         m.stash_task()
 
 
-def compress_all(modules):
+def compress_all(modules, task_idx=None):
     for m in modules:
-        m.compress()
+        m.compress(task_idx=task_idx)
     # aggregate the per-module compression diagnostics
     ret = [m.last_retained for m in modules if m.last_retained is not None]
     sig = [m.last_sigma_next for m in modules if m.last_sigma_next is not None]
