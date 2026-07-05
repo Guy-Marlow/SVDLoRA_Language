@@ -223,6 +223,14 @@ def main():
                    help="number of initial tasks to use the fixed warm-up rank before adaptive")
     # per-task retained-energy diagnostics (extra full SVD/module/task -> EXPENSIVE). OFF for real runs.
     p.add_argument('--svd_diag', action='store_true')
+    # ---- merge-op ablation: how the boundary folds sketch+residual back into the sketch ----
+    # randsvd (default) = spectral truncation (the method). countsketch = unbiased random
+    # signed merge of the concatenated factors' rank dimension into --cs_rank buckets
+    # (naive-merge ablation; fixed-rank only, incompatible with --svd_energy_target/warm-up).
+    p.add_argument('--merge_op', choices=['randsvd', 'countsketch'], default='randsvd')
+    p.add_argument('--cs_rank', type=int, default=None,
+                   help='CountSketch bucket count k (deployed sketch rank); default = --svd_rank '
+                        '(parameter-matched to fixed-rank SVDLoRA)')
     # O-LoRA HPs
     p.add_argument('--lamda_1', type=float, default=0.5)     # orthogonality weight
     p.add_argument('--lamda_2', type=float, default=0.0)     # L2 on current LoRA
@@ -260,9 +268,16 @@ def main():
     args = p.parse_args()
 
     set_random_seed(args.seed)
+    if args.merge_op == 'countsketch':
+        assert args.method == 'svdlora', "--merge_op countsketch only applies to --method svdlora"
+        assert args.svd_energy_target is None and args.svd_warmup_fixed_rank is None, \
+            "countsketch merge is fixed-rank only (no spectrum): drop --svd_energy_target/--svd_warmup_*"
+    _cs_k = args.cs_rank if args.cs_rank is not None else args.svd_rank
     print("=" * 60)
     detail = {
-        'svdlora': f"period P={args.svd_period} compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}",
+        'svdlora': (f"period P={args.svd_period} compress, r_hat={args.svd_rank}, oversampling={args.svd_oversampling}"
+                    + (f" | merge_op=COUNTSKETCH k={_cs_k} (naive-merge ablation)"
+                       if args.merge_op == 'countsketch' else "")),
         'seqlora': "single drifting adapter (no compression)",
         'olora':   f"per-task adapters, orth penalty lamda_1={args.lamda_1} lamda_2={args.lamda_2}",
         'inflora': (f"per-task adapters, RANDOM frozen-A (DualGPM align DISABLED), train B only"
@@ -319,7 +334,9 @@ def main():
                                  layer_indices=layer_indices,
                                  energy_target=args.svd_energy_target, diag=args.svd_diag,
                                  warmup_fixed_rank=args.svd_warmup_fixed_rank,
-                                 warmup_tasks=args.svd_warmup_tasks)
+                                 warmup_tasks=args.svd_warmup_tasks,
+                                 merge_op=args.merge_op, cs_rank=args.cs_rank,
+                                 cs_seed=args.seed)
     print(f"Injected {len(modules)} adapter modules ({args.method}, svd_layers={args.svd_layers})")
 
     # InfLoRA DualGPM state (per-module)
@@ -336,7 +353,8 @@ def main():
         f"_P{args.svd_period}" if args.svd_period != 1 else "") + (
         f"_warm{args.svd_warmup_fixed_rank}x{args.svd_warmup_tasks}"
         if args.svd_warmup_fixed_rank is not None else "") + (
-        "_noalign" if (args.method == 'inflora' and args.inflora_no_align) else "")
+        "_noalign" if (args.method == 'inflora' and args.inflora_no_align) else "") + (
+        f"_cs{_cs_k}" if args.merge_op == 'countsketch' else "")
     svd_diag_path = f"{args.out_dir}/svdlora_diag_{args.method}_{_tag}.json"
     metrics_path = f"{args.out_dir}/metrics_{args.method}_{_tag}.json"
     metrics = {"method": args.method, "num_tasks": args.num_tasks, "order_seed": args.order_seed,
@@ -466,8 +484,10 @@ def main():
                         rec = {"task": i, **{k: diag[k] for k in
                                ("retained_mean", "retained_min", "sigma_next_mean", "sigma_next_max",
                                 "fro_mean", "fro_max", "residual_fro_mean", "residual_fro_max",
-                                "r_hat_mean", "r_hat_max", "r_hat_total")},
-                               "r_hat_per_module": diag.get("r_hat")}
+                                "r_hat_mean", "r_hat_max", "r_hat_total",
+                                "merge_relerr_mean", "merge_relerr_max")},
+                               "r_hat_per_module": diag.get("r_hat"),
+                               "merge_relerr_per_module": diag.get("merge_relerr")}
                         svd_diag_records.append(rec)
                         with open(svd_diag_path, "w") as f:
                             json.dump(svd_diag_records, f, indent=2)
