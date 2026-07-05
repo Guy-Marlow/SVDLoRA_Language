@@ -3,8 +3,8 @@
 #SBATCH --time=96:00:00
 #SBATCH --gres=gpu:2
 #SBATCH --open-mode=append
-#SBATCH --output=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/cs_ablation_750t/slurm_cs750_%j.out
-#SBATCH --error=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/cs_ablation_750t/slurm_cs750_%j.err
+#SBATCH --output=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/slurm_cs750_%j.out
+#SBATCH --error=/data/gmar762/research/continuous_learning/svd_sketching_language/tokmem/atomic/run_logs/slurm_cs750_%j.err
 #
 # CountSketch merge-op ablation at 750 tasks + the two missing adaptive-SVDLoRA eps=0.005 seeds.
 #   Llama-3.2-3B-Instruct, main_svdlora_baseline.py (same eval scheme + metrics as the 100-task
