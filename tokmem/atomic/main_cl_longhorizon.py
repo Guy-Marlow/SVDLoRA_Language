@@ -78,7 +78,9 @@ def deployed_now(modules, method, lora_r):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--method', choices=['seqlora', 'svdlora', 'olora'], default='svdlora')
+    # 'base' = no adapters, no training: a single stride-eval of the raw model over the
+    # full task ordering (the frozen-baseline row for the checkpoint curves).
+    p.add_argument('--method', choices=['seqlora', 'svdlora', 'olora', 'base'], default='svdlora')
     p.add_argument('--tasks_dir', default='natural-instructions-2.8/tasks')
     p.add_argument('--model_name', default="Qwen/Qwen2.5-0.5B-Instruct")
     p.add_argument('--num_tasks', type=int, default=750)
@@ -109,6 +111,9 @@ def main():
     p.add_argument('--lamda_1', type=float, default=0.5)
     # cumulative eval cadence (tasks)
     p.add_argument('--eval_every_tasks', type=int, default=50)
+    # eval only tasks whose 1-indexed training position k has k % stride == 0 (1 = all seen
+    # tasks). stride 2 halves checkpoint-eval cost; the evaluated subset is fixed per seed.
+    p.add_argument('--eval_stride', type=int, default=1)
     # boundary regime
     p.add_argument('--boundary_mode', choices=['task', 'sample'], default='task')
     p.add_argument('--boundary_samples_mult', type=float, default=2.5,
@@ -139,7 +144,9 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16, device_map=args.device)
     targets = tuple(args.target_modules.split(","))
-    if args.method == 'olora':
+    if args.method == 'base':
+        modules = []          # raw model: deployed_now reports rank/mem/flops = 0
+    elif args.method == 'olora':
         modules = inject_multislot_lora(model, target_modules=targets, r=args.lora_r,
                                         alpha=args.lora_alpha, dropout=args.lora_dropout,
                                         collect_cov=False)
@@ -170,7 +177,9 @@ def main():
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
             "svd_energy_target": args.svd_energy_target if args.method == 'svdlora' else None,
             "lamda_1": args.lamda_1 if args.method == 'olora' else None,
-            "eval_every_tasks": args.eval_every_tasks, "status": "running",
+            "eval_every_tasks": args.eval_every_tasks, "eval_stride": args.eval_stride,
+            "task_order": [name for name, _ in train_tasks],   # position k = index+1
+            "status": "running",
             "per_task_train_seconds": [], "checkpoints": []}
     report.write_metrics(out_path, meta)
 
@@ -205,7 +214,9 @@ def main():
 
     def do_eval(tasks_seen):
         nonlocal train_seconds, last_ckpt_train_seconds
-        seen = [ex for grp in ordered_test[:tasks_seen] for ex in grp]
+        # stride subset: 1-indexed training positions k <= tasks_seen with k % stride == 0
+        positions = [k for k in range(1, tasks_seen + 1) if k % args.eval_stride == 0]
+        seen = [ex for k in positions for ex in ordered_test[k - 1]]
         model.eval()
         t0 = time.time()
         results, _ = evaluate_with_generation(
@@ -217,7 +228,7 @@ def main():
         n_seen = max(len(seen), 1)
         train_delta = train_seconds - last_ckpt_train_seconds
         last_ckpt_train_seconds = train_seconds
-        rec = {"tasks_seen": tasks_seen, "n_test": len(seen),
+        rec = {"tasks_seen": tasks_seen, "n_eval_tasks": len(positions), "n_test": len(seen),
                "samples_trained": state.get("samples", 0), "n_boundaries": state["n_boundaries"],
                "rougeL": results.get("rougeL"), "exact_match": results.get("exact_match"),
                "deployed_rank_total": rank, "adapter_mb": round(byts / 1024 / 1024, 4),
@@ -232,9 +243,21 @@ def main():
                "per_task": results.get("per_task")}
         meta["checkpoints"].append(rec)
         report.write_metrics(out_path, meta)
-        print(f"  [eval @ {tasks_seen} tasks] ROUGE-L {rec['rougeL']:.2f} | EM {rec['exact_match']:.2f} "
+        print(f"  [eval @ {tasks_seen} tasks, {len(positions)} evald (stride {args.eval_stride})] "
+              f"ROUGE-L {rec['rougeL']:.2f} | EM {rec['exact_match']:.2f} "
               f"| rank {rank} | {rec['adapter_mb']:.2f}MB | boundaries {state['n_boundaries']} "
               f"| train {train_seconds/60:.1f}m | eval {eval_s/60:.1f}m", flush=True)
+
+    # ---- base: no adapters, no training -- one stride-eval over the full ordering ----
+    if args.method == 'base':
+        print("[base] raw model, no training: single stride-eval on the full ordering", flush=True)
+        do_eval(n_tasks)
+        meta["status"] = "done"
+        report.write_metrics(out_path, meta)
+        final = meta["checkpoints"][-1]
+        print(f"\nDONE | {tag} | base ROUGE-L {final['rougeL']:.2f} EM {final['exact_match']:.2f}",
+              flush=True)
+        return
 
     # ---- stream ----
     try:
