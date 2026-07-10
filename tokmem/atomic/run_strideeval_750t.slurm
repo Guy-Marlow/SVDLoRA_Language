@@ -23,10 +23,9 @@
 #   sensitivity grid + cs-ablation runs, so each seed shares its task set AND order with
 #   the existing 750t svdlora runs (same for both backbones, since the task order only
 #   depends on set_seed/order_seed, not the model). Baselines run first (cheap), then
-#   seed-major method trios. Qwen (0.5B, cheap) entries are listed before the equivalent
-#   Llama (3B, slow) entries in the flat run list, so under the round-robin GPU-slot
-#   assignment below most Qwen runs land earlier than most Llama runs (not a strict
-#   per-slot guarantee, but the full Qwen sweep should finish well ahead of Llama).
+#   seed-major method trios. LLAMA IS PRIORITIZED: the Llama batch runs to completion
+#   (using all GPU slots) BEFORE the Qwen batch starts at all -- not just an ordering
+#   hint, a hard barrier -- since Llama is the more important benchmark of the two.
 #
 #   Each backbone writes to its OWN subdir (run_logs/strideeval_750t/{llama3b,qwen05b})
 #   since the run tag does not encode the model name.
@@ -59,17 +58,18 @@ COMMON="--num_tasks ${N} --min_instances 560 \
   --lr 5e-5 --svd_energy_target 0.005 --lamda_1 0.5 \
   --boundary_mode task --eval_every_tasks 75 --eval_stride 2"
 
-# entries: model|method|seed. Qwen (fast) interleaved before Llama (slow) per method/seed
-# group; within each backbone, baselines first, then seed-major method trios.
-RUNS=(
-  "qwen|base|1993"    "qwen|base|1994"    "qwen|base|1995"
-  "llama|base|1993"   "llama|base|1994"   "llama|base|1995"
-  "qwen|svdlora|1993" "qwen|seqlora|1993" "qwen|olora|1993"
-  "qwen|svdlora|1994" "qwen|seqlora|1994" "qwen|olora|1994"
-  "qwen|svdlora|1995" "qwen|seqlora|1995" "qwen|olora|1995"
+# entries: model|method|seed. Baselines first, then seed-major method trios, per backbone.
+RUNS_LLAMA=(
+  "llama|base|1993"    "llama|base|1994"    "llama|base|1995"
   "llama|svdlora|1993" "llama|seqlora|1993" "llama|olora|1993"
   "llama|svdlora|1994" "llama|seqlora|1994" "llama|olora|1994"
   "llama|svdlora|1995" "llama|seqlora|1995" "llama|olora|1995"
+)
+RUNS_QWEN=(
+  "qwen|base|1993"    "qwen|base|1994"    "qwen|base|1995"
+  "qwen|svdlora|1993" "qwen|seqlora|1993" "qwen|olora|1993"
+  "qwen|svdlora|1994" "qwen|seqlora|1994" "qwen|olora|1994"
+  "qwen|svdlora|1995" "qwen|seqlora|1995" "qwen|olora|1995"
 )
 
 run_one() {
@@ -100,17 +100,24 @@ NGPU="${SLURM_GPUS_ON_NODE:-}"
 [ -z "$NGPU" ] && NGPU="$(nvidia-smi -L 2>/dev/null | wc -l)"
 case "$NGPU" in (''|*[!0-9]*) NGPU=1 ;; esac
 [ "$NGPU" -lt 1 ] && NGPU=1
-echo "==== stride750: ${#RUNS[@]} runs on NGPU=${NGPU} slot(s) $(date) ====" >> "$DRV"
 
 worker() {
-  local gpu="$1" i
-  for (( i=gpu; i<${#RUNS[@]}; i+=NGPU )); do
-    run_one "$gpu" "${RUNS[$i]}"
+  local gpu="$1" name="$2[@]" i
+  local -a runs=("${!name}")
+  for (( i=gpu; i<${#runs[@]}; i+=NGPU )); do
+    run_one "$gpu" "${runs[$i]}"
   done
 }
 
+echo "==== stride750: LLAMA batch (${#RUNS_LLAMA[@]} runs) on NGPU=${NGPU} slot(s) $(date) ====" >> "$DRV"
 for (( g=0; g<NGPU; g++ )); do
-  worker "$g" &
+  worker "$g" RUNS_LLAMA &
+done
+wait
+echo "==== LLAMA batch complete -- starting QWEN batch (${#RUNS_QWEN[@]} runs) $(date) ====" >> "$DRV"
+
+for (( g=0; g<NGPU; g++ )); do
+  worker "$g" RUNS_QWEN &
 done
 wait
 echo "ALL STRIDEEVAL-750T RUNS COMPLETE $(date)" >> "$DRV"
